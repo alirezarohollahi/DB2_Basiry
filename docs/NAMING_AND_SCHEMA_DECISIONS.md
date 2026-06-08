@@ -4,30 +4,17 @@
 
 The project has two independent operational source systems.
 
-### 1. Program Operations Source
+### Program Operations Source
+- Database: `Source_ProgramOps_DB`
+- Schema: `program_ops`
 
-Database:
-- `Source_ProgramOps_DB`
+This source owns centers, children, teachers, users, task planning, assessments, daily statuses, notes, and audit logs.
 
-Schema:
-- `program_ops`
+### Finance Operations Source
+- Database: `Source_FinanceOps_DB`
+- Schema: `finance_ops`
 
-Reason:
-- The child/teacher/assessment system is broader than only child and teacher data.
-- It includes educational/therapy operations, centers, children, teachers, task planning, daily status, assessments, notes, and audit logs.
-- `program_ops` is a clearer business name than `src` or `child_teacher`.
-
-### 2. Finance Operations Source
-
-Database:
-- `Source_FinanceOps_DB`
-
-Schema:
-- `finance_ops`
-
-Reason:
-- This source owns donations, campaigns, expenses, payments, allocations, transactions, and currency rates.
-- `finance_ops` is explicit and avoids confusion with warehouse finance marts.
+This source owns donors, campaigns, donations, expenses, payments, budget allocations, transactions, and currency rates.
 
 ## Shared entities
 
@@ -38,20 +25,11 @@ The following entities are shared conceptually:
 - teacher
 - date
 
-In Phase 1, they are not physically shared as SQL tables across both source databases.
+In the source layer, the two operational systems stay independent. Cross-database foreign keys are intentionally avoided.
 
-Reason:
-- Operational systems should stay independent.
-- Cross-database foreign keys make deployment and ETL harder.
-- The finance source may only receive `center_id`, `child_id`, and `teacher_id` as reference IDs from another operational system.
-
-## Warehouse layer later
-
-In the data warehouse, shared entities should become conformed dimensions:
+In the warehouse layer, these should become conformed dimensions:
 
 - `dw.dim_center`
 - `dw.dim_child`
 - `dw.dim_teacher`
 - `dw.dim_date`
-
-Both marts should use the same dimension keys for these entities.
