@@ -6,7 +6,7 @@ Target DBMS:
 
 Current phase:
 - Phase 1: Create and populate operational source databases.
-- Phase 2: Create staging databases/tables and Program Ops source-to-staging ETL procedures.
+- Phase 2: Create staging databases/tables and source-to-staging ETL procedures for both source systems.
 
 Included SQL scripts:
 1. `sql/01_source/01_create_source_program_ops_db.sql`
@@ -18,6 +18,12 @@ Included SQL scripts:
 7. `sql/02_staging/07_create_stg_finance_ops_db.sql`
 8. `sql/02_staging/08_create_stg_finance_ops_tables.sql`
 9. `sql/04_etl/09_create_etl_program_ops_to_staging_procedures.sql`
+10. `sql/04_etl/10_create_etl_finance_ops_to_staging_procedures.sql`
+
+Important finance ETL note:
+- `10_create_etl_finance_ops_to_staging_procedures.sql` does not use SQL Server `UPDATE` then `INSERT`.
+- Small tables use `TRUNCATE TABLE` + `INSERT`.
+- Large/transactional tables use `UPDATE` existing rows, then `INSERT` new rows.
 
 Recommended execution order in SSMS:
 1. Run `sql/01_source/01_create_source_program_ops_db.sql`
@@ -29,21 +35,14 @@ Recommended execution order in SSMS:
 7. Run `sql/02_staging/07_create_stg_finance_ops_db.sql`
 8. Run `sql/02_staging/08_create_stg_finance_ops_tables.sql`
 9. Run `sql/04_etl/09_create_etl_program_ops_to_staging_procedures.sql`
+10. Run `sql/04_etl/10_create_etl_finance_ops_to_staging_procedures.sql`
 
-To run Program Ops ETL later as a job:
+To run Finance Ops ETL later as a job:
 
 ```sql
-USE Stg_ProgramOps_DB;
+USE Stg_FinanceOps_DB;
 GO
 
-EXEC etl_admin.usp_run_stg_program_ops_all
+EXEC etl_admin.usp_run_stg_finance_ops_all
     @to_date = '2025-12-31 23:59:59';
 ```
-
-ETL design:
-- One procedure per Program Ops source table.
-- One main procedure runs all table procedures in a safe order.
-- Each table procedure accepts `@to_date`.
-- Each table procedure validates rows before loading.
-- Each table procedure uses `MERGE` instead of truncating/reloading.
-- ETL activity is logged in `etl_admin.etl_batch` and `etl_admin.etl_load_log`.

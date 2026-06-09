@@ -19,20 +19,19 @@ Run these scripts in SQL Server Management Studio:
 ## ETL layer
 
 9. `sql/04_etl/09_create_etl_program_ops_to_staging_procedures.sql`
+10. `sql/04_etl/10_create_etl_finance_ops_to_staging_procedures.sql`
 
-## Run Program Ops ETL later
+## Run Finance Ops ETL later
 
 ```sql
-USE Stg_ProgramOps_DB;
+USE Stg_FinanceOps_DB;
 GO
 
-EXEC etl_admin.usp_run_stg_program_ops_all
+EXEC etl_admin.usp_run_stg_finance_ops_all
     @to_date = '2025-12-31 23:59:59';
 ```
 
-Created databases:
-
-- `Source_ProgramOps_DB`
-- `Source_FinanceOps_DB`
-- `Stg_ProgramOps_DB`
-- `Stg_FinanceOps_DB`
+Finance ETL note:
+- No `UPDATE` then `INSERT` command is used.
+- Small tables use `TRUNCATE + INSERT`.
+- Large tables use `UPDATE existing rows` then `INSERT new rows`.
