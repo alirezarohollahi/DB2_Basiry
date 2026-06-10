@@ -15,11 +15,10 @@
 
  Requirements covered:
    1. Each procedure writes detailed logs to etl_admin.etl_load_log.
-   2. Each procedure inserts new rows and updates changed rows using MERGE.
-   3. There is one ETL procedure for each Program Operations source table.
-   4. Each procedure accepts @to_date and loads source data up to that date.
-   5. Each procedure validates rows before loading correct rows into staging.
-   6. No procedure truncates or reloads entire staging tables.
+   2. Small lookup procedures reload with TRUNCATE + INSERT; large/growing procedures use UPDATE existing rows + INSERT new rows. The load logic avoids native upsert syntax.
+   4. There is one ETL procedure for each Program Operations source table.
+   5. Each procedure accepts @to_date and loads source data up to that date.
+   6. Each procedure validates rows before loading correct rows into staging.
    7. A main procedure runs all staging ETL procedures in a safe order.
 
  Important:
@@ -117,7 +116,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -150,48 +148,52 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.centers;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.centers AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.centers
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [name],
+                [city],
+                [address],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[name] = src.[name],
-            tgt.[city] = src.[city],
-            tgt.[address] = src.[address],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'centers',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [name], [city], [address], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[name], src.[city], src.[address], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'centers', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[name],
+            src.[city],
+            src.[address],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'centers',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -324,7 +326,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -361,23 +362,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.children AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[center_id] = src.[center_id],
             tgt.[first_name] = src.[first_name],
             tgt.[last_name] = src.[last_name],
@@ -398,15 +386,71 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [center_id], [first_name], [last_name], [national_code], [birth_date], [gender], [enrollment_date], [status], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[center_id], src.[first_name], src.[last_name], src.[national_code], src.[birth_date], src.[gender], src.[enrollment_date], src.[status], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'children', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.children AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.children
+            (
+                [id],
+                [center_id],
+                [first_name],
+                [last_name],
+                [national_code],
+                [birth_date],
+                [gender],
+                [enrollment_date],
+                [status],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[center_id],
+            src.[first_name],
+            src.[last_name],
+            src.[national_code],
+            src.[birth_date],
+            src.[gender],
+            src.[enrollment_date],
+            src.[status],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'children',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.children AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -539,7 +583,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -575,23 +618,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.teachers AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[center_id] = src.[center_id],
             tgt.[first_name] = src.[first_name],
             tgt.[last_name] = src.[last_name],
@@ -611,15 +641,69 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [center_id], [first_name], [last_name], [phone], [email], [employment_status], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[center_id], src.[first_name], src.[last_name], src.[phone], src.[email], src.[employment_status], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'teachers', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.teachers AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.teachers
+            (
+                [id],
+                [center_id],
+                [first_name],
+                [last_name],
+                [phone],
+                [email],
+                [employment_status],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[center_id],
+            src.[first_name],
+            src.[last_name],
+            src.[phone],
+            src.[email],
+            src.[employment_status],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'teachers',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.teachers AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -752,7 +836,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -786,23 +869,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.users AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[username] = src.[username],
             tgt.[password_hash] = src.[password_hash],
             tgt.[role] = src.[role],
@@ -820,15 +890,65 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [username], [password_hash], [role], [teacher_id], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[username], src.[password_hash], src.[role], src.[teacher_id], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'users', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.users AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.users
+            (
+                [id],
+                [username],
+                [password_hash],
+                [role],
+                [teacher_id],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[username],
+            src.[password_hash],
+            src.[role],
+            src.[teacher_id],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'users',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.users AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -961,7 +1081,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -993,47 +1112,50 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.domains;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.domains AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.domains
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [name],
+                [description],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[name] = src.[name],
-            tgt.[description] = src.[description],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'domains',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [name], [description], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[name], src.[description], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'domains', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[name],
+            src.[description],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'domains',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -1166,7 +1288,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -1200,49 +1321,54 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.score_scales;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.score_scales AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.score_scales
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [name],
+                [min_score],
+                [max_score],
+                [description],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[name] = src.[name],
-            tgt.[min_score] = src.[min_score],
-            tgt.[max_score] = src.[max_score],
-            tgt.[description] = src.[description],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'score_scales',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [name], [min_score], [max_score], [description], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[name], src.[min_score], src.[max_score], src.[description], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'score_scales', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[name],
+            src.[min_score],
+            src.[max_score],
+            src.[description],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'score_scales',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -1375,7 +1501,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -1407,47 +1532,50 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.closure_reasons;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.closure_reasons AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.closure_reasons
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [title],
+                [description],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[title] = src.[title],
-            tgt.[description] = src.[description],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'closure_reasons',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [title], [description], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[title], src.[description], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'closure_reasons', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[title],
+            src.[description],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'closure_reasons',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -1580,7 +1708,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -1612,47 +1739,50 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.absence_reasons;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.absence_reasons AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.absence_reasons
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [title],
+                [description],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[title] = src.[title],
-            tgt.[description] = src.[description],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'absence_reasons',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [title], [description], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[title], src.[description], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'absence_reasons', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[title],
+            src.[description],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'absence_reasons',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -1785,7 +1915,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -1817,47 +1946,50 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Small lookup table: full refresh with TRUNCATE + INSERT.
+        TRUNCATE TABLE stg_program_ops.no_score_reasons;
 
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.no_score_reasons AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
+        INSERT INTO stg_program_ops.no_score_reasons
             (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
+                [id],
+                [title],
+                [description],
+                [is_active],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
             )
-            THEN UPDATE SET
-            tgt.[title] = src.[title],
-            tgt.[description] = src.[description],
-            tgt.[is_active] = src.[is_active],
-            tgt.[created_at] = src.[created_at],
-            tgt.[updated_at] = src.[updated_at],
-            tgt.etl_batch_id = @effective_batch_id,
-            tgt.source_system = N'PROGRAM_OPS',
-            tgt.source_database = N'Source_ProgramOps_DB',
-            tgt.source_schema = N'program_ops',
-            tgt.source_table = N'no_score_reasons',
-            tgt.extracted_at = @extract_time,
-            tgt.source_updated_at = src.source_updated_at,
-            tgt.row_hash = src.row_hash,
-            tgt.is_valid = 1,
-            tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [title], [description], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[title], src.[description], src.[is_active], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'no_score_reasons', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        SELECT
+            src.[id],
+            src.[title],
+            src.[description],
+            src.[is_active],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'no_score_reasons',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @rows_updated = 0;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -1990,7 +2122,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -2025,23 +2156,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.task_templates AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[domain_id] = src.[domain_id],
             tgt.[title] = src.[title],
             tgt.[description] = src.[description],
@@ -2060,15 +2178,67 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [domain_id], [title], [description], [default_score_scale_id], [is_active], [created_by], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[domain_id], src.[title], src.[description], src.[default_score_scale_id], src.[is_active], src.[created_by], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'task_templates', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.task_templates AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.task_templates
+            (
+                [id],
+                [domain_id],
+                [title],
+                [description],
+                [default_score_scale_id],
+                [is_active],
+                [created_by],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[domain_id],
+            src.[title],
+            src.[description],
+            src.[default_score_scale_id],
+            src.[is_active],
+            src.[created_by],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'task_templates',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.task_templates AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -2201,7 +2371,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -2236,23 +2405,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.center_daily_status AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[center_id] = src.[center_id],
             tgt.[date] = src.[date],
             tgt.[status] = src.[status],
@@ -2271,15 +2427,67 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [center_id], [date], [status], [closure_reason_id], [note], [created_by], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[center_id], src.[date], src.[status], src.[closure_reason_id], src.[note], src.[created_by], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'center_daily_status', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.center_daily_status AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.center_daily_status
+            (
+                [id],
+                [center_id],
+                [date],
+                [status],
+                [closure_reason_id],
+                [note],
+                [created_by],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[center_id],
+            src.[date],
+            src.[status],
+            src.[closure_reason_id],
+            src.[note],
+            src.[created_by],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'center_daily_status',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.center_daily_status AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -2412,7 +2620,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -2447,23 +2654,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.child_daily_status AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[child_id] = src.[child_id],
             tgt.[date] = src.[date],
             tgt.[status] = src.[status],
@@ -2482,15 +2676,67 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [child_id], [date], [status], [absence_reason_id], [note], [created_by], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[child_id], src.[date], src.[status], src.[absence_reason_id], src.[note], src.[created_by], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'child_daily_status', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.child_daily_status AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.child_daily_status
+            (
+                [id],
+                [child_id],
+                [date],
+                [status],
+                [absence_reason_id],
+                [note],
+                [created_by],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[child_id],
+            src.[date],
+            src.[status],
+            src.[absence_reason_id],
+            src.[note],
+            src.[created_by],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'child_daily_status',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.child_daily_status AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -2623,7 +2869,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -2661,23 +2906,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.child_task_plans AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[child_id] = src.[child_id],
             tgt.[task_template_id] = src.[task_template_id],
             tgt.[domain_id] = src.[domain_id],
@@ -2699,15 +2931,73 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [child_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [start_date], [end_date], [is_active], [created_by], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[child_id], src.[task_template_id], src.[domain_id], src.[task_title], src.[score_scale_id], src.[start_date], src.[end_date], src.[is_active], src.[created_by], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'child_task_plans', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.child_task_plans AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.child_task_plans
+            (
+                [id],
+                [child_id],
+                [task_template_id],
+                [domain_id],
+                [task_title],
+                [score_scale_id],
+                [start_date],
+                [end_date],
+                [is_active],
+                [created_by],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[child_id],
+            src.[task_template_id],
+            src.[domain_id],
+            src.[task_title],
+            src.[score_scale_id],
+            src.[start_date],
+            src.[end_date],
+            src.[is_active],
+            src.[created_by],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'child_task_plans',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.child_task_plans AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -2840,7 +3130,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -2878,23 +3167,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.daily_task_assignments AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[child_id] = src.[child_id],
             tgt.[date] = src.[date],
             tgt.[child_task_plan_id] = src.[child_task_plan_id],
@@ -2916,15 +3192,73 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [child_id], [date], [child_task_plan_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [planned_by], [status], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[child_id], src.[date], src.[child_task_plan_id], src.[task_template_id], src.[domain_id], src.[task_title], src.[score_scale_id], src.[planned_by], src.[status], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'daily_task_assignments', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.daily_task_assignments AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.daily_task_assignments
+            (
+                [id],
+                [child_id],
+                [date],
+                [child_task_plan_id],
+                [task_template_id],
+                [domain_id],
+                [task_title],
+                [score_scale_id],
+                [planned_by],
+                [status],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[child_id],
+            src.[date],
+            src.[child_task_plan_id],
+            src.[task_template_id],
+            src.[domain_id],
+            src.[task_title],
+            src.[score_scale_id],
+            src.[planned_by],
+            src.[status],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'daily_task_assignments',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.daily_task_assignments AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -3057,7 +3391,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -3094,23 +3427,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.assessment_sessions AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[child_id] = src.[child_id],
             tgt.[teacher_id] = src.[teacher_id],
             tgt.[center_id] = src.[center_id],
@@ -3131,15 +3451,71 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [child_id], [teacher_id], [center_id], [date], [started_at], [ended_at], [session_status], [general_note], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[child_id], src.[teacher_id], src.[center_id], src.[date], src.[started_at], src.[ended_at], src.[session_status], src.[general_note], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'assessment_sessions', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.assessment_sessions AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.assessment_sessions
+            (
+                [id],
+                [child_id],
+                [teacher_id],
+                [center_id],
+                [date],
+                [started_at],
+                [ended_at],
+                [session_status],
+                [general_note],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[child_id],
+            src.[teacher_id],
+            src.[center_id],
+            src.[date],
+            src.[started_at],
+            src.[ended_at],
+            src.[session_status],
+            src.[general_note],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'assessment_sessions',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.assessment_sessions AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -3272,7 +3648,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -3312,23 +3687,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.task_assessments AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[daily_task_assignment_id] = src.[daily_task_assignment_id],
             tgt.[assessment_session_id] = src.[assessment_session_id],
             tgt.[child_id] = src.[child_id],
@@ -3352,15 +3714,77 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [daily_task_assignment_id], [assessment_session_id], [child_id], [teacher_id], [date], [score], [normalized_score], [assessment_status], [no_score_reason_id], [attempt_no], [note], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[daily_task_assignment_id], src.[assessment_session_id], src.[child_id], src.[teacher_id], src.[date], src.[score], src.[normalized_score], src.[assessment_status], src.[no_score_reason_id], src.[attempt_no], src.[note], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'task_assessments', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.task_assessments AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.task_assessments
+            (
+                [id],
+                [daily_task_assignment_id],
+                [assessment_session_id],
+                [child_id],
+                [teacher_id],
+                [date],
+                [score],
+                [normalized_score],
+                [assessment_status],
+                [no_score_reason_id],
+                [attempt_no],
+                [note],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[daily_task_assignment_id],
+            src.[assessment_session_id],
+            src.[child_id],
+            src.[teacher_id],
+            src.[date],
+            src.[score],
+            src.[normalized_score],
+            src.[assessment_status],
+            src.[no_score_reason_id],
+            src.[attempt_no],
+            src.[note],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'task_assessments',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.task_assessments AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -3493,7 +3917,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -3531,23 +3954,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.notes AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[note_scope] = src.[note_scope],
             tgt.[center_id] = src.[center_id],
             tgt.[child_id] = src.[child_id],
@@ -3569,15 +3979,73 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [note_scope], [center_id], [child_id], [teacher_id], [date], [daily_task_assignment_id], [task_assessment_id], [note_text], [created_by], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[note_scope], src.[center_id], src.[child_id], src.[teacher_id], src.[date], src.[daily_task_assignment_id], src.[task_assessment_id], src.[note_text], src.[created_by], src.[created_at], src.[updated_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'notes', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.notes AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.notes
+            (
+                [id],
+                [note_scope],
+                [center_id],
+                [child_id],
+                [teacher_id],
+                [date],
+                [daily_task_assignment_id],
+                [task_assessment_id],
+                [note_text],
+                [created_by],
+                [created_at],
+                [updated_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[note_scope],
+            src.[center_id],
+            src.[child_id],
+            src.[teacher_id],
+            src.[date],
+            src.[daily_task_assignment_id],
+            src.[task_assessment_id],
+            src.[note_text],
+            src.[created_by],
+            src.[created_at],
+            src.[updated_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'notes',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.notes AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -3710,7 +4178,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -3741,23 +4208,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.note_batches AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[created_by] = src.[created_by],
             tgt.[note_scope] = src.[note_scope],
             tgt.[note_text] = src.[note_text],
@@ -3772,15 +4226,59 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [created_by], [note_scope], [note_text], [created_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[created_by], src.[note_scope], src.[note_text], src.[created_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'note_batches', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.note_batches AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.note_batches
+            (
+                [id],
+                [created_by],
+                [note_scope],
+                [note_text],
+                [created_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[created_by],
+            src.[note_scope],
+            src.[note_text],
+            src.[created_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'note_batches',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.note_batches AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -3913,7 +4411,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -3943,23 +4440,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.note_batch_items AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[note_batch_id] = src.[note_batch_id],
             tgt.[note_id] = src.[note_id],
             tgt.etl_batch_id = @effective_batch_id,
@@ -3972,15 +4456,55 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [note_batch_id], [note_id], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[note_batch_id], src.[note_id], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'note_batch_items', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.note_batch_items AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.note_batch_items
+            (
+                [id],
+                [note_batch_id],
+                [note_id],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[note_batch_id],
+            src.[note_id],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'note_batch_items',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.note_batch_items AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET
@@ -4113,7 +4637,6 @@ BEGIN
 
         IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
         IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
-        IF OBJECT_ID('tempdb..#merge_actions') IS NOT NULL DROP TABLE #merge_actions;
 
         SELECT
             src.[id] AS [id],
@@ -4147,23 +4670,10 @@ BEGIN
         DELETE FROM #valid
         WHERE validation_message IS NOT NULL;
 
-        SET @rows_valid = @@ROWCOUNT;
-
-        CREATE TABLE #merge_actions (
-            merge_action NVARCHAR(10) NOT NULL
-        );
-
-        MERGE stg_program_ops.audit_logs AS tgt
-        USING #valid AS src
-            ON tgt.[id] = src.[id]
-        WHEN MATCHED AND
-            (
-                tgt.row_hash IS NULL
-                OR src.row_hash IS NULL
-                OR tgt.row_hash <> src.row_hash
-                OR ISNULL(tgt.is_valid, 0) <> 1
-            )
-            THEN UPDATE SET
+        SELECT @rows_valid = COUNT(*) FROM #valid;
+        -- Large/growing table: update existing changed rows, then insert new rows.
+        UPDATE tgt
+        SET
             tgt.[user_id] = src.[user_id],
             tgt.[entity_name] = src.[entity_name],
             tgt.[entity_id] = src.[entity_id],
@@ -4181,15 +4691,65 @@ BEGIN
             tgt.row_hash = src.row_hash,
             tgt.is_valid = 1,
             tgt.validation_message = NULL
-        WHEN NOT MATCHED BY TARGET
-            THEN INSERT
-                ([id], [user_id], [entity_name], [entity_id], [action], [old_value], [new_value], [created_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
-            VALUES
-                (src.[id], src.[user_id], src.[entity_name], src.[entity_id], src.[action], src.[old_value], src.[new_value], src.[created_at], @effective_batch_id, N'PROGRAM_OPS', N'Source_ProgramOps_DB', N'program_ops', N'audit_logs', @extract_time, src.source_updated_at, src.row_hash, 1, NULL)
-        OUTPUT $action INTO #merge_actions;
+        FROM stg_program_ops.audit_logs AS tgt
+        INNER JOIN #valid AS src
+            ON tgt.[id] = src.[id]
+        WHERE
+            tgt.row_hash IS NULL
+            OR src.row_hash IS NULL
+            OR tgt.row_hash <> src.row_hash
+            OR ISNULL(tgt.is_valid, 0) <> 1;
 
-        SELECT @rows_inserted = COUNT(*) FROM #merge_actions WHERE merge_action = N'INSERT';
-        SELECT @rows_updated = COUNT(*) FROM #merge_actions WHERE merge_action = N'UPDATE';
+        SET @rows_updated = @@ROWCOUNT;
+
+        INSERT INTO stg_program_ops.audit_logs
+            (
+                [id],
+                [user_id],
+                [entity_name],
+                [entity_id],
+                [action],
+                [old_value],
+                [new_value],
+                [created_at],
+                [etl_batch_id],
+                [source_system],
+                [source_database],
+                [source_schema],
+                [source_table],
+                [extracted_at],
+                [source_updated_at],
+                [row_hash],
+                [is_valid],
+                [validation_message]
+            )
+        SELECT
+            src.[id],
+            src.[user_id],
+            src.[entity_name],
+            src.[entity_id],
+            src.[action],
+            src.[old_value],
+            src.[new_value],
+            src.[created_at],
+            @effective_batch_id,
+            N'PROGRAM_OPS',
+            N'Source_ProgramOps_DB',
+            N'program_ops',
+            N'audit_logs',
+            @extract_time,
+            src.source_updated_at,
+            src.row_hash,
+            1,
+            NULL
+        FROM #valid AS src
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM stg_program_ops.audit_logs AS tgt
+            WHERE tgt.[id] = src.[id]
+        );
+
+        SET @rows_inserted = @@ROWCOUNT;
 
         UPDATE etl_admin.etl_load_log
         SET

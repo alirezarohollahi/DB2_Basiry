@@ -46,3 +46,51 @@ GO
 EXEC etl_admin.usp_run_stg_finance_ops_all
     @to_date = '2025-12-31 23:59:59';
 ```
+
+## Phase 3 Update - Data Warehouse MART 1
+
+This package now includes the first Data Warehouse mart scripts:
+
+- `sql/03_warehouse/11_create_dw_db.sql`
+- `sql/03_warehouse/12_create_dw_mart1_tables.sql`
+
+MART 1 creates the student/child task progress warehouse area with dimensions, facts, unknown dimension rows, foreign keys, and query indexes.
+
+Run order:
+
+1. Source database scripts
+2. Staging database/table scripts
+3. Staging ETL scripts
+4. `11_create_dw_db.sql`
+5. `12_create_dw_mart1_tables.sql`
+
+The next development phase is DW ETL from staging to MART 1.
+
+## Phase 3 Update - Data Warehouse MART 2
+
+This package now also includes the second Data Warehouse mart script:
+
+- `sql/03_warehouse/13_create_dw_mart2_tables.sql`
+
+MART 2 creates the charity financial warehouse area with donor, campaign, category, donation type, status, currency, allocation type dimensions and financial fact tables.
+
+MART 2 facts:
+
+- `dw.fact_donation_transaction`
+- `dw.fact_monthly_financial_snapshot`
+- `dw.fact_donation_lifecycle`
+- `dw.fact_budget_allocation_event`
+
+MART 2 reuses shared dimensions from MART 1:
+
+- `dw.dim_date`
+- `dw.dim_center`
+- `dw.dim_child`
+
+Updated warehouse run order:
+
+1. `sql/03_warehouse/11_create_dw_db.sql`
+2. `sql/03_warehouse/12_create_dw_mart1_tables.sql`
+3. `sql/03_warehouse/13_create_dw_mart2_tables.sql`
+
+The next development phase is DW ETL from staging to MART 1 and MART 2.

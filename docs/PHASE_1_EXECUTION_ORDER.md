@@ -35,3 +35,66 @@ Finance ETL note:
 - No `UPDATE` then `INSERT` command is used.
 - Small tables use `TRUNCATE + INSERT`.
 - Large tables use `UPDATE existing rows` then `INSERT new rows`.
+
+---
+
+## Phase 3 - Data Warehouse / MART 1
+
+After source and staging scripts are created and staging ETL scripts are ready, run the warehouse scripts in this order:
+
+1. `sql/03_warehouse/11_create_dw_db.sql`
+   - Creates `Charity_DW_DB`
+   - Creates schemas: `dw`, `etl_admin`
+   - Creates DW ETL batch/log control tables
+
+2. `sql/03_warehouse/12_create_dw_mart1_tables.sql`
+   - Creates MART 1 dimensions:
+     - `dw.dim_date`
+     - `dw.dim_center`
+     - `dw.dim_teacher`
+     - `dw.dim_child`
+     - `dw.dim_domain`
+     - `dw.dim_task`
+     - `dw.dim_score_scale`
+     - `dw.dim_assessment_status`
+     - `dw.dim_no_score_reason`
+   - Creates MART 1 facts:
+     - `dw.fact_tran_student_task_progress`
+     - `dw.fact_daily_student_task_progress`
+     - `dw.fact_child_snapshot_accumulation`
+     - `dw.fact_child_task_event`
+   - Adds unknown dimension rows with surrogate key `-1`
+   - Adds foreign keys and query indexes
+
+Next step after this phase:
+- Build ETL procedures from `Stg_ProgramOps_DB.stg_program_ops` to `Charity_DW_DB.dw` for MART 1 dimensions and facts.
+
+---
+
+## Warehouse MART 2 Table Creation
+
+After MART 1 tables are created, run:
+
+```sql
+:r sql/03_warehouse/13_create_dw_mart2_tables.sql
+```
+
+This creates the charity financial mart tables:
+
+- `dw.dim_donor`
+- `dw.dim_campaign`
+- `dw.dim_category`
+- `dw.dim_donation_type`
+- `dw.dim_status`
+- `dw.dim_currency`
+- `dw.dim_allocation_type`
+- `dw.fact_donation_transaction`
+- `dw.fact_monthly_financial_snapshot`
+- `dw.fact_donation_lifecycle`
+- `dw.fact_budget_allocation_event`
+
+MART 2 reuses shared dimensions from MART 1:
+
+- `dw.dim_date`
+- `dw.dim_center`
+- `dw.dim_child`
