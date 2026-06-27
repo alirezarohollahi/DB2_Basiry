@@ -1,0 +1,200 @@
+ok now we should impelement  the procedure for fact_donation_lifecycle
+Pay attention to this point
+1. each procedure must have a start and end time as an input arg  that update dimentions or fact in that period 
+2. for each change (insert data in tables or temp tables or ...) you must make log row in specfic log tables
+3. you must give me two procedure one for first load and next for normal phases 
+4. in most of times you should update tmp tables in a with loop from start to end time 
+5. all tables has  unknown rows with key -1  
+6. At the beginning of the load first ETL, it is better to reset the sequence to the initial value, and at the beginning of the incremental ETL, we can also reset it to max(the value used) + interval.
+7. procedure must be fast so don't use window functions or other thing that has to much load
+8. this procedure must run in practical envierment 
+9.if you make this procedure for a dim care a about slowly changing dimentions type and fill it base on it's type 
+10. acumulative facts are facts that do not have time and their measures must be updated from the beginning to the present, not in a single time period but in the entire available time.
+11. care alot about types of facts and impelement them base on their types 
+this is a example for fact care about logics :
+"""
+CREATE PROCEDURE LoadMonthlySnapshot
+(
+      @YearNumber INT,
+      @MonthNumber INT
+)
+AS
+BEGIN
+
+DECLARE @SnapshotDateKey INT
+DECLARE @SnapshotDate DATE
+
+SELECT
+      @SnapshotDateKey = DateKey,
+      @SnapshotDate    = FullDate
+FROM DimDate
+WHERE PersianYear  = @YearNumber
+AND PersianMonth = @MonthNumber
+AND IsMonthEnd = 1
+
+DECLARE @PrevMonth INT
+DECLARE @PrevYear INT
+
+IF @MonthNumber = 1
+BEGIN
+      SET @PrevMonth = 12
+      SET @PrevYear  = @YearNumber - 1
+END
+ELSE
+BEGIN
+      SET @PrevMonth = @MonthNumber - 1
+      SET @PrevYear  = @YearNumber
+END
+
+--- داده ماه قبل را پیدا و در یک تمپ قرار میدهیم 
+SELECT
+      PolicyKey,
+      CustomerKey,
+      InsuranceTypeKey,
+      TotalPremiumPaid,
+      TotalClaimPaid
+INTO #PrevSnapshot
+FROM FactPolicyMonthlySnapshot F
+JOIN DimDate D
+     ON F.SnapshotDateKey = D.DateKey
+WHERE D.PersianYear = @PrevYear
+AND D.PersianMonth = @PrevMonth
+AND D.IsMonthEnd = 1
+
+
+
+CREATE TABLE #CurrentMonthMovement
+(
+      PolicyKey INT,
+      PremiumAmount DECIMAL(18,2),
+      ClaimAmount DECIMAL(18,2)
+)
+
+DECLARE @MonthStartDate DATE
+DECLARE @MonthEndDate DATE
+
+SELECT
+      @MonthStartDate = MIN(FullDate),
+      @MonthEndDate   = MAX(FullDate)
+FROM DimDate
+WHERE PersianYear  = @YearNumber
+AND PersianMonth = @MonthNumber
+
+DECLARE @CurrentDate DATE
+
+SET @CurrentDate =@MonthStartDate
+
+
+WHILE @CurrentDate <= @MonthEndDate
+BEGIN
+
+      INSERT INTO #CurrentMonthMovement
+
+      SELECT
+            PolicyKey,
+            SUM(PaymentAmount),
+            0
+      FROM FactPremiumPayment FP
+      JOIN DimDate D
+           ON FP.DateKey=D.DateKey
+      WHERE D.FullDate=@CurrentDate
+      GROUP BY PolicyKey
+
+      UNION ALL
+
+      SELECT
+            PolicyKey,
+            0,
+            SUM(ClaimAmount)
+      FROM FactClaim FC
+      JOIN DimDate D
+           ON FC.DateKey=D.DateKey
+      WHERE D.FullDate=@CurrentDate
+      GROUP BY PolicyKey
+
+      SET @CurrentDate =
+      DATEADD(DAY,1,@CurrentDate)
+
+END
+
+-- پیدا کردن جمع یک ماه
+SELECT
+      PolicyKey,
+      SUM(PremiumAmount) AS CurrentPremium,
+      SUM(ClaimAmount) AS CurrentClaim
+INTO #CurrentMonthAgg
+FROM #CurrentMonthMovement
+GROUP BY PolicyKey
+
+-- جمع با رکورد ماه قبل
+SELECT
+
+      P.PolicyKey,
+
+      ISNULL(S.TotalPremiumPaid,0)
+      +
+      ISNULL(C.CurrentPremium,0)
+      AS TotalPremiumPaid,
+
+      ISNULL(S.TotalClaimPaid,0)
+      +
+      ISNULL(C.CurrentClaim,0)
+      AS TotalClaimPaid
+
+INTO #NewSnapshot
+
+FROM DimPolicy P
+
+LEFT JOIN #PrevSnapshot S
+      ON P.PolicyKey=S.PolicyKey
+
+LEFT JOIN #CurrentMonthAgg C
+      ON P.PolicyKey=C.PolicyKey
+
+INSERT INTO FactPolicyMonthlySnapshot
+(
+      SnapshotDate,
+      PolicyKey,
+      StatusKey,
+      TotalPremiumPaid,
+      TotalClaimPaid,
+      RemainingDaysToExpire
+)
+
+SELECT
+
+      @CurrentMonthEnd,
+
+      N.PolicyKey,
+
+      CASE
+
+            WHEN P.ExpireDate < @CurrentMonthEnd
+                  THEN 2 -- expired
+
+            WHEN N.TotalClaimPaid > 0
+                  THEN 3 -- paid
+
+            ELSE 1 --active
+
+      END,
+
+      N.TotalPremiumPaid,
+
+      N.TotalClaimPaid,
+
+      CASE
+            WHEN DATEDIFF(DAY,
+                          @CurrentMonthEnd,
+                          P.ExpireDate) < 0
+                 THEN 0
+            ELSE DATEDIFF(DAY,
+                          @CurrentMonthEnd,
+                          P.ExpireDate)
+      END
+
+FROM #NewSnapshot N
+JOIN DimPolicy P
+     ON N.PolicyKey=P.PolicyKey
+end
+"""

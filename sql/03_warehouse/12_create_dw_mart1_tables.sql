@@ -61,19 +61,29 @@ GO
 =============================================================================*/
 
 CREATE TABLE dw.dim_date (
-    date_key             INT NULL,
-    full_date            DATE NULL,
-    [day]                TINYINT NULL,
-    day_name             NVARCHAR(20) NULL,
-    day_of_week          TINYINT NULL,
-    day_of_year          SMALLINT NULL,
-    week_of_year         TINYINT NULL,
-    [month]              TINYINT NULL,
-    month_name           NVARCHAR(20) NULL,
-    [quarter]            TINYINT NULL,
-    [year]               SMALLINT NULL,
-    is_weekend           BIT NULL,
-    created_at           DATETIME2(0) NULL
+    TimeKey                      INT NULL,
+    FullDateAlternateKey         DATE NULL,
+    PersianFullDateAlternateKey  NVARCHAR(10) NULL,
+    DayNumberOfWeek             TINYINT NULL,
+    PersianDayNumberOfWeek      TINYINT NULL,
+    EnglishDayNameOfWeek        NVARCHAR(20) NULL,
+    PersianDayNameOfWeek        NVARCHAR(20) NULL,
+    DayNumberOfMonth            TINYINT NULL,
+    PersianDayNumberOfMonth     TINYINT NULL,
+    DayNumberOfYear             SMALLINT NULL,
+    PersianDayNumberOfYear      SMALLINT NULL,
+    WeekNumberOfYear            TINYINT NULL,
+    PersianWeekNumberOfYear     TINYINT NULL,
+    EnglishMonthName            NVARCHAR(20) NULL,
+    PersianMonthName            NVARCHAR(20) NULL,
+    MonthNumberOfYear           TINYINT NULL,
+    PersianMonthNumberOfYear    TINYINT NULL,
+    CalendarQuarter             TINYINT NULL,
+    PersianCalendarQuarter      TINYINT NULL,
+    CalendarYear                SMALLINT NULL,
+    PersianCalendarYear         SMALLINT NULL,
+    CalendarSemester            TINYINT NULL,
+    PersianCalendarSemester     TINYINT NULL
 );
 GO
 
@@ -214,10 +224,21 @@ GO
 =============================================================================*/
 
 INSERT INTO dw.dim_date (
-    date_key, full_date, [day], day_name, day_of_week, day_of_year,
-    week_of_year, [month], month_name, [quarter], [year], is_weekend, created_at
+    TimeKey, FullDateAlternateKey, PersianFullDateAlternateKey,
+    DayNumberOfWeek, PersianDayNumberOfWeek, EnglishDayNameOfWeek, PersianDayNameOfWeek,
+    DayNumberOfMonth, PersianDayNumberOfMonth, DayNumberOfYear, PersianDayNumberOfYear,
+    WeekNumberOfYear, PersianWeekNumberOfYear, EnglishMonthName, PersianMonthName,
+    MonthNumberOfYear, PersianMonthNumberOfYear, CalendarQuarter, PersianCalendarQuarter,
+    CalendarYear, PersianCalendarYear, CalendarSemester, PersianCalendarSemester
 )
-VALUES (-1, CONVERT(DATE, '19000101'), 1, N'Unknown', 0, 0, 0, 0, N'Unknown', 0, 1900, 0, SYSDATETIME());
+VALUES (
+    -1, CONVERT(DATE, '19000101'), N'نامشخص',
+    0, 0, N'Unknown', N'نامشخص',
+    0, 0, 0, 0,
+    0, 0, N'Unknown', N'نامشخص',
+    0, 0, 0, 0,
+    1900, 0, 0, 0
+);
 GO
 
 SET IDENTITY_INSERT dw.dim_center ON;

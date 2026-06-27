@@ -76,19 +76,15 @@ BEGIN
         source_system       NVARCHAR(100) NOT NULL,
         target_layer        NVARCHAR(100) NOT NULL,
         mart_name           NVARCHAR(100) NULL,
-        batch_status        NVARCHAR(50) NOT NULL CONSTRAINT DF_dw_etl_batch_status DEFAULT (N'created'),
-        started_at          DATETIME2(0) NOT NULL CONSTRAINT DF_dw_etl_batch_started_at DEFAULT (SYSDATETIME()),
+        batch_status        NVARCHAR(50) NOT NULL,
+        started_at          DATETIME2(0) NOT NULL,
         ended_at            DATETIME2(0) NULL,
         rows_read           INT NULL,
         rows_inserted       INT NULL,
         rows_updated        INT NULL,
         rows_rejected       INT NULL,
         error_message       NVARCHAR(MAX) NULL,
-        created_by          NVARCHAR(128) NOT NULL CONSTRAINT DF_dw_etl_batch_created_by DEFAULT (SUSER_SNAME()),
-
-        CONSTRAINT PK_dw_etl_batch PRIMARY KEY CLUSTERED (etl_batch_id),
-        CONSTRAINT CK_dw_etl_batch_status
-            CHECK (batch_status IN (N'created', N'running', N'succeeded', N'failed', N'cancelled'))
+        created_by          NVARCHAR(128) NOT NULL
     );
 END
 GO
@@ -113,15 +109,9 @@ BEGIN
         rows_inserted       INT NULL,
         rows_updated        INT NULL,
         rows_rejected       INT NULL,
-        started_at          DATETIME2(0) NOT NULL CONSTRAINT DF_dw_etl_load_log_started_at DEFAULT (SYSDATETIME()),
+        started_at          DATETIME2(0) NOT NULL,
         ended_at            DATETIME2(0) NULL,
-        message             NVARCHAR(MAX) NULL,
-
-        CONSTRAINT PK_dw_etl_load_log PRIMARY KEY CLUSTERED (etl_load_log_id),
-        CONSTRAINT FK_dw_etl_load_log_etl_batch
-            FOREIGN KEY (etl_batch_id) REFERENCES etl_admin.etl_batch(etl_batch_id),
-        CONSTRAINT CK_dw_etl_load_log_status
-            CHECK (load_status IN (N'created', N'running', N'succeeded', N'failed', N'skipped'))
+        message             NVARCHAR(MAX) NULL
     );
 END
 GO
