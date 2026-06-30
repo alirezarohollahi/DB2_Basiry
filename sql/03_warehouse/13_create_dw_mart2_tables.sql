@@ -37,7 +37,7 @@
    - fact_donation_lifecycle:
        One row per donation lifecycle record.
    - fact_budget_allocation_event:
-       One row per budget allocation event.
+       One fact-less row per budget allocation relationship event.
 
  Design choices:
    - No MERGE is used here. This script only creates tables.
@@ -45,7 +45,7 @@
        dw.dim_date, dw.dim_center, dw.dim_child.
    - New MART 2 dimensions use surrogate IDENTITY keys.
    - Unknown dimension rows use key = -1, inserted with IDENTITY_INSERT.
-   - Facts keep source natural identifiers for traceability back to staging/source.
+   - Facts exclude source natural identifiers/codes and source-system; they keep DW keys, measures, and ETL audit columns only.
    - Re-runnable for development: drops MART 2 facts and MART 2-only dimensions
      before recreating them. Shared MART 1 dimensions are not dropped.
 ===============================================================================
@@ -102,7 +102,6 @@ DROP TABLE IF EXISTS dw.fact_payment_transaction;
 DROP TABLE IF EXISTS dw.fact_expense_transaction;
 DROP TABLE IF EXISTS dw.fact_donation_transaction;
 
-DROP TABLE IF EXISTS dw.dim_allocation_type;
 DROP TABLE IF EXISTS dw.dim_currency;
 DROP TABLE IF EXISTS dw.dim_status;
 DROP TABLE IF EXISTS dw.dim_donation_type;
@@ -121,7 +120,6 @@ CREATE TABLE dw.dim_donor (
     full_name            NVARCHAR(250) NULL,
     donor_type           NVARCHAR(50) NULL,
     is_active            BIT NULL,
-    source_system        NVARCHAR(100) NULL,
     row_hash             VARBINARY(32) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
@@ -136,7 +134,6 @@ CREATE TABLE dw.dim_campaign (
     target_amount        DECIMAL(18,2) NULL,
     start_date           DATE NULL,
     end_date             DATE NULL,
-    source_system        NVARCHAR(100) NULL,
     row_hash             VARBINARY(32) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
@@ -150,7 +147,6 @@ CREATE TABLE dw.dim_category (
     parent_category_id   INT NULL,
     parent_category_name NVARCHAR(200) NULL,
     category_status      NVARCHAR(30) NULL,
-    source_system        NVARCHAR(100) NULL,
     row_hash             VARBINARY(32) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
@@ -161,7 +157,6 @@ CREATE TABLE dw.dim_donation_type (
     donation_type_key    INT IDENTITY(1,1) NOT NULL,
     code                 NVARCHAR(50) NULL,
     title                NVARCHAR(100) NULL,
-    source_system        NVARCHAR(100) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
 );
@@ -173,7 +168,6 @@ CREATE TABLE dw.dim_status (
     code                 NVARCHAR(50) NULL,
     title                NVARCHAR(100) NULL,
     category             NVARCHAR(50) NULL,
-    source_system        NVARCHAR(100) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
 );
@@ -183,21 +177,11 @@ CREATE TABLE dw.dim_currency (
     currency_key         INT IDENTITY(1,1) NOT NULL,
     code                 NVARCHAR(10) NULL,
     name                 NVARCHAR(100) NULL,
-    source_system        NVARCHAR(100) NULL,
     created_at           DATETIME2(0) NULL,
     updated_at           DATETIME2(0) NULL
 );
 GO
 
-CREATE TABLE dw.dim_allocation_type (
-    allocation_type_key  INT IDENTITY(1,1) NOT NULL,
-    code                 NVARCHAR(50) NULL,
-    title                NVARCHAR(100) NULL,
-    source_system        NVARCHAR(100) NULL,
-    created_at           DATETIME2(0) NULL,
-    updated_at           DATETIME2(0) NULL
-);
-GO
 
 /*=============================================================================
   4. Unknown Dimension Rows
@@ -205,59 +189,52 @@ GO
 
 SET IDENTITY_INSERT dw.dim_donor ON;
 INSERT INTO dw.dim_donor
-    (donor_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+    (donor_key, donor_id, full_name, donor_type, is_active, row_hash, created_at, updated_at)
 VALUES
-    (-1, -1, N'Unknown', N'unknown', 0, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+    (-1, -1, N'Unknown', N'unknown', 0, NULL, SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_donor OFF;
 GO
 
 SET IDENTITY_INSERT dw.dim_campaign ON;
 INSERT INTO dw.dim_campaign
-    (campaign_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+    (campaign_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, row_hash, created_at, updated_at)
 VALUES
-    (-1, -1, N'Unknown', N'unknown', NULL, NULL, NULL, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+    (-1, -1, N'Unknown', N'unknown', NULL, NULL, NULL, NULL, SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_campaign OFF;
 GO
 
 SET IDENTITY_INSERT dw.dim_category ON;
 INSERT INTO dw.dim_category
-    (category_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+    (category_key, category_id, category_name, parent_category_id, parent_category_name, category_status, row_hash, created_at, updated_at)
 VALUES
-    (-1, -1, N'Unknown', NULL, NULL, N'unknown', N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+    (-1, -1, N'Unknown', NULL, NULL, N'unknown', NULL, SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_category OFF;
 GO
 
 SET IDENTITY_INSERT dw.dim_donation_type ON;
 INSERT INTO dw.dim_donation_type
-    (donation_type_key, code, title, source_system, created_at, updated_at)
+    (donation_type_key, code, title, created_at, updated_at)
 VALUES
-    (-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+    (-1, N'unknown', N'Unknown', SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_donation_type OFF;
 GO
 
 SET IDENTITY_INSERT dw.dim_status ON;
 INSERT INTO dw.dim_status
-    (status_key, status_type, code, title, category, source_system, created_at, updated_at)
+    (status_key, status_type, code, title, category, created_at, updated_at)
 VALUES
-    (-1, N'unknown', N'unknown', N'Unknown', N'unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+    (-1, N'unknown', N'unknown', N'Unknown', N'unknown', SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_status OFF;
 GO
 
 SET IDENTITY_INSERT dw.dim_currency ON;
 INSERT INTO dw.dim_currency
-    (currency_key, code, name, source_system, created_at, updated_at)
+    (currency_key, code, name, created_at, updated_at)
 VALUES
-    (-1, N'UNK', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+    (-1, N'UNK', N'Unknown', SYSDATETIME(), NULL);
 SET IDENTITY_INSERT dw.dim_currency OFF;
 GO
 
-SET IDENTITY_INSERT dw.dim_allocation_type ON;
-INSERT INTO dw.dim_allocation_type
-    (allocation_type_key, code, title, source_system, created_at, updated_at)
-VALUES
-    (-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
-SET IDENTITY_INSERT dw.dim_allocation_type OFF;
-GO
 
 /*=============================================================================
   5. Fact Tables - MART 2 Heap Tables
@@ -276,12 +253,6 @@ CREATE TABLE dw.fact_donation_transaction (
     amount                   DECIMAL(18,2) NULL,
     is_confirmed             BIT NULL,
     is_refunded              BIT NULL,
-
-    source_donation_id       BIGINT NULL,
-    source_donor_id          BIGINT NULL,
-    source_campaign_id       BIGINT NULL,
-    source_reference_code    NVARCHAR(100) NULL,
-    source_system            NVARCHAR(100) NULL,
     etl_batch_id             INT NULL,
     loaded_at                DATETIME2(0) NULL
 );
@@ -299,13 +270,6 @@ CREATE TABLE dw.fact_expense_transaction (
     amount                  DECIMAL(18,2) NULL,
     is_approved             BIT NULL,
     is_rejected             BIT NULL,
-    description             NVARCHAR(2000) NULL,
-
-    source_expense_id       BIGINT NULL,
-    source_center_id        BIGINT NULL,
-    source_child_id         BIGINT NULL,
-    source_category_id      BIGINT NULL,
-    source_system           NVARCHAR(100) NULL,
     etl_batch_id            INT NULL,
     loaded_at               DATETIME2(0) NULL
 );
@@ -319,14 +283,9 @@ CREATE TABLE dw.fact_payment_transaction (
     status_key              INT NULL,
 
     payment_type            NVARCHAR(50) NULL,
-    source_teacher_id       BIGINT NULL,
     amount                  DECIMAL(18,2) NULL,
     is_paid                 BIT NULL,
     is_cancelled            BIT NULL,
-
-    source_payment_id       BIGINT NULL,
-    source_center_id        BIGINT NULL,
-    source_system           NVARCHAR(100) NULL,
     etl_batch_id            INT NULL,
     loaded_at               DATETIME2(0) NULL
 );
@@ -345,8 +304,6 @@ CREATE TABLE dw.fact_monthly_financial_snapshot (
     expense_count                  INT NULL,
     payment_count                  INT NULL,
     allocation_count               INT NULL,
-
-    source_system                  NVARCHAR(100) NULL,
     etl_batch_id                   INT NULL,
     loaded_at                      DATETIME2(0) NULL
 );
@@ -363,14 +320,9 @@ CREATE TABLE dw.fact_donation_lifecycle (
 
     current_stage          NVARCHAR(50) NULL,
     donation_amount        DECIMAL(18,2) NULL,
-    days_to_confirm        INT NULL,
-    days_to_allocate       INT NULL,
-
-
-    source_donation_id     BIGINT NULL,
-    source_donor_id        BIGINT NULL,
-    source_campaign_id     BIGINT NULL,
-    source_system          NVARCHAR(100) NULL,
+    min_donation           DECIMAL(18,2) NULL,
+    max_donation           DECIMAL(18,2) NULL,
+    avg_donation           DECIMAL(18,2) NULL,
     etl_batch_id           INT NULL,
     loaded_at              DATETIME2(0) NULL
 );
@@ -384,17 +336,6 @@ CREATE TABLE dw.fact_budget_allocation_event (
     child_key              INT NULL,
     category_key           INT NULL,
     campaign_key           INT NULL,
-    allocation_type_key    INT NULL,
-
-    allocated_amount       DECIMAL(18,2) NULL,
-    reason                 NVARCHAR(MAX) NULL,
-    source_allocation_id   BIGINT NULL,
-    source_type            NVARCHAR(50) NULL,
-    source_id              BIGINT NULL,
-    source_center_id       BIGINT NULL,
-    source_child_id        BIGINT NULL,
-    source_category_id     BIGINT NULL,
-    source_system          NVARCHAR(100) NULL,
     etl_batch_id           INT NULL,
     loaded_at              DATETIME2(0) NULL
 );
