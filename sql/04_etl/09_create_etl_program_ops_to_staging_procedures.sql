@@ -114,9 +114,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_centers_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_centers_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_centers_src
+            ([id], [name], [city], [address], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[name] AS [name],
@@ -127,28 +129,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[name]), CONVERT(NVARCHAR(MAX), src.[city]), CONVERT(NVARCHAR(MAX), src.[address]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.centers src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_centers_valid
+            ([id], [name], [city], [address], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN name IS NULL THEN N'name missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_centers_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_centers_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_centers_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_centers_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.centers;
 
@@ -190,7 +192,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_centers_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -324,9 +326,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_children_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_children_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_children_src
+            ([id], [center_id], [first_name], [last_name], [national_code], [birth_date], [gender], [enrollment_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[center_id] AS [center_id],
@@ -341,28 +345,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[first_name]), CONVERT(NVARCHAR(MAX), src.[last_name]), CONVERT(NVARCHAR(MAX), src.[national_code]), CONVERT(NVARCHAR(MAX), src.[birth_date]), CONVERT(NVARCHAR(MAX), src.[gender]), CONVERT(NVARCHAR(MAX), src.[enrollment_date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.children src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_children_valid
+            ([id], [center_id], [first_name], [last_name], [national_code], [birth_date], [gender], [enrollment_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN first_name IS NULL THEN N'first_name missing; ' ELSE N'' END, CASE WHEN last_name IS NULL THEN N'last_name missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN center_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id) THEN N'center_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_children_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_children_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_children_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_children_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -387,7 +391,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.children AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_children_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -443,7 +447,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_children_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.children AS tgt
@@ -581,9 +585,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_teachers_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_teachers_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_teachers_src
+            ([id], [center_id], [first_name], [last_name], [phone], [email], [employment_status], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[center_id] AS [center_id],
@@ -597,28 +603,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[first_name]), CONVERT(NVARCHAR(MAX), src.[last_name]), CONVERT(NVARCHAR(MAX), src.[phone]), CONVERT(NVARCHAR(MAX), src.[email]), CONVERT(NVARCHAR(MAX), src.[employment_status]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.teachers src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_teachers_valid
+            ([id], [center_id], [first_name], [last_name], [phone], [email], [employment_status], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN first_name IS NULL THEN N'first_name missing; ' ELSE N'' END, CASE WHEN last_name IS NULL THEN N'last_name missing; ' ELSE N'' END, CASE WHEN employment_status IS NULL THEN N'employment_status missing; ' ELSE N'' END, CASE WHEN center_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id) THEN N'center_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_teachers_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_teachers_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_teachers_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_teachers_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -642,7 +648,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.teachers AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_teachers_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -696,7 +702,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_teachers_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.teachers AS tgt
@@ -834,9 +840,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_users_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_users_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_users_src
+            ([id], [username], [password_hash], [role], [teacher_id], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[username] AS [username],
@@ -848,28 +856,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[username]), CONVERT(NVARCHAR(MAX), src.[password_hash]), CONVERT(NVARCHAR(MAX), src.[role]), CONVERT(NVARCHAR(MAX), src.[teacher_id]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.users src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_users_valid
+            ([id], [username], [password_hash], [role], [teacher_id], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN username IS NULL THEN N'username missing; ' ELSE N'' END, CASE WHEN password_hash IS NULL THEN N'password_hash missing; ' ELSE N'' END, CASE WHEN role IS NULL THEN N'role missing; ' ELSE N'' END, CASE WHEN teacher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id) THEN N'teacher_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_users_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_users_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_users_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_users_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -891,7 +899,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.users AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_users_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -941,7 +949,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_users_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.users AS tgt
@@ -1079,9 +1087,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_domains_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_domains_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_domains_src
+            ([id], [name], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[name] AS [name],
@@ -1091,28 +1101,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[name]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.domains src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_domains_valid
+            ([id], [name], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN name IS NULL THEN N'name missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_domains_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_domains_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_domains_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_domains_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.domains;
 
@@ -1152,7 +1162,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_domains_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -1286,9 +1296,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_score_scales_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_score_scales_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_score_scales_src
+            ([id], [name], [min_score], [max_score], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[name] AS [name],
@@ -1300,28 +1312,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[name]), CONVERT(NVARCHAR(MAX), src.[min_score]), CONVERT(NVARCHAR(MAX), src.[max_score]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.score_scales src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_score_scales_valid
+            ([id], [name], [min_score], [max_score], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN name IS NULL THEN N'name missing; ' ELSE N'' END, CASE WHEN min_score IS NULL THEN N'min_score missing; ' ELSE N'' END, CASE WHEN max_score IS NULL THEN N'max_score missing; ' ELSE N'' END, CASE WHEN min_score > max_score THEN N'min_score > max_score; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_score_scales_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_score_scales_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_score_scales_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_score_scales_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.score_scales;
 
@@ -1365,7 +1377,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_score_scales_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -1499,9 +1511,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_closure_reasons_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_closure_reasons_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_closure_reasons_src
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[title] AS [title],
@@ -1511,28 +1525,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[title]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.closure_reasons src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_closure_reasons_valid
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN title IS NULL THEN N'title missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_closure_reasons_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_closure_reasons_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_closure_reasons_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_closure_reasons_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.closure_reasons;
 
@@ -1572,7 +1586,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_closure_reasons_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -1706,9 +1720,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_absence_reasons_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_absence_reasons_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_absence_reasons_src
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[title] AS [title],
@@ -1718,28 +1734,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[title]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.absence_reasons src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_absence_reasons_valid
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN title IS NULL THEN N'title missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_absence_reasons_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_absence_reasons_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_absence_reasons_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_absence_reasons_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.absence_reasons;
 
@@ -1779,7 +1795,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_absence_reasons_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -1913,9 +1929,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_no_score_reasons_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_no_score_reasons_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_no_score_reasons_src
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[title] AS [title],
@@ -1925,28 +1943,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[title]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.no_score_reasons src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_no_score_reasons_valid
+            ([id], [title], [description], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN title IS NULL THEN N'title missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_no_score_reasons_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_no_score_reasons_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_no_score_reasons_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_no_score_reasons_valid;
         -- Small lookup table: full refresh with TRUNCATE + INSERT.
         TRUNCATE TABLE stg_program_ops.no_score_reasons;
 
@@ -1986,7 +2004,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src;
+        FROM stg_program_ops.etl_tmp_no_score_reasons_valid AS src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -2120,9 +2138,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_task_templates_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_task_templates_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_task_templates_src
+            ([id], [domain_id], [title], [description], [default_score_scale_id], [is_active], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[domain_id] AS [domain_id],
@@ -2135,28 +2155,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[domain_id]), CONVERT(NVARCHAR(MAX), src.[title]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[default_score_scale_id]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.task_templates src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_task_templates_valid
+            ([id], [domain_id], [title], [description], [default_score_scale_id], [is_active], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN domain_id IS NULL THEN N'domain_id missing; ' ELSE N'' END, CASE WHEN title IS NULL THEN N'title missing; ' ELSE N'' END, CASE WHEN domain_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id) THEN N'domain_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id); ' ELSE N'' END, CASE WHEN default_score_scale_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.default_score_scale_id) THEN N'default_score_scale_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.default_score_scale_id); ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_task_templates_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_task_templates_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_task_templates_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_task_templates_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -2179,7 +2199,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.task_templates AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_task_templates_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -2231,7 +2251,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_task_templates_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.task_templates AS tgt
@@ -2369,9 +2389,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_center_daily_status_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_center_daily_status_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_center_daily_status_src
+            ([id], [center_id], [date], [status], [closure_reason_id], [note], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[center_id] AS [center_id],
@@ -2384,28 +2406,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[closure_reason_id]), CONVERT(NVARCHAR(MAX), src.[note]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.center_daily_status src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_center_daily_status_valid
+            ([id], [center_id], [date], [status], [closure_reason_id], [note], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN [date] IS NULL THEN N'[date] missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN center_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id) THEN N'center_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id); ' ELSE N'' END, CASE WHEN closure_reason_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.closure_reasons p WHERE p.id = s.closure_reason_id) THEN N'closure_reason_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.closure_reasons p WHERE p.id = s.closure_reason_id); ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_center_daily_status_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_center_daily_status_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_center_daily_status_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_center_daily_status_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -2428,7 +2450,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.center_daily_status AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_center_daily_status_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -2480,7 +2502,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_center_daily_status_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.center_daily_status AS tgt
@@ -2618,9 +2640,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_child_daily_status_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_child_daily_status_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_child_daily_status_src
+            ([id], [child_id], [date], [status], [absence_reason_id], [note], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[child_id] AS [child_id],
@@ -2633,28 +2657,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[absence_reason_id]), CONVERT(NVARCHAR(MAX), src.[note]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.child_daily_status src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_child_daily_status_valid
+            ([id], [child_id], [date], [status], [absence_reason_id], [note], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN child_id IS NULL THEN N'child_id missing; ' ELSE N'' END, CASE WHEN [date] IS NULL THEN N'[date] missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN absence_reason_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.absence_reasons p WHERE p.id = s.absence_reason_id) THEN N'absence_reason_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.absence_reasons p WHERE p.id = s.absence_reason_id); ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_child_daily_status_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_child_daily_status_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_child_daily_status_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_child_daily_status_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -2677,7 +2701,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.child_daily_status AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_child_daily_status_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -2729,7 +2753,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_child_daily_status_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.child_daily_status AS tgt
@@ -2867,9 +2891,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_child_task_plans_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_child_task_plans_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_child_task_plans_src
+            ([id], [child_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [start_date], [end_date], [is_active], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[child_id] AS [child_id],
@@ -2885,28 +2911,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[task_template_id]), CONVERT(NVARCHAR(MAX), src.[domain_id]), CONVERT(NVARCHAR(MAX), src.[task_title]), CONVERT(NVARCHAR(MAX), src.[score_scale_id]), CONVERT(NVARCHAR(MAX), src.[start_date]), CONVERT(NVARCHAR(MAX), src.[end_date]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.child_task_plans src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_child_task_plans_valid
+            ([id], [child_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [start_date], [end_date], [is_active], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN child_id IS NULL THEN N'child_id missing; ' ELSE N'' END, CASE WHEN domain_id IS NULL THEN N'domain_id missing; ' ELSE N'' END, CASE WHEN task_title IS NULL THEN N'task_title missing; ' ELSE N'' END, CASE WHEN score_scale_id IS NULL THEN N'score_scale_id missing; ' ELSE N'' END, CASE WHEN start_date IS NULL THEN N'start_date missing; ' ELSE N'' END, CASE WHEN end_date IS NOT NULL AND start_date IS NOT NULL AND start_date > end_date THEN N'end_date IS NOT NULL AND start_date IS NOT NULL AND start_date > end_date; ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN task_template_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_templates p WHERE p.id = s.task_template_id) THEN N'task_template_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_templates p WHERE p.id = s.task_template_id); ' ELSE N'' END, CASE WHEN domain_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id) THEN N'domain_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id); ' ELSE N'' END, CASE WHEN score_scale_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.score_scale_id) THEN N'score_scale_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.score_scale_id); ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_child_task_plans_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_child_task_plans_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_child_task_plans_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_child_task_plans_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -2932,7 +2958,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.child_task_plans AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_child_task_plans_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -2990,7 +3016,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_child_task_plans_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.child_task_plans AS tgt
@@ -3128,9 +3154,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_daily_task_assignments_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_daily_task_assignments_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_daily_task_assignments_src
+            ([id], [child_id], [date], [child_task_plan_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [planned_by], [status], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[child_id] AS [child_id],
@@ -3146,28 +3174,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[child_task_plan_id]), CONVERT(NVARCHAR(MAX), src.[task_template_id]), CONVERT(NVARCHAR(MAX), src.[domain_id]), CONVERT(NVARCHAR(MAX), src.[task_title]), CONVERT(NVARCHAR(MAX), src.[score_scale_id]), CONVERT(NVARCHAR(MAX), src.[planned_by]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.daily_task_assignments src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_daily_task_assignments_valid
+            ([id], [child_id], [date], [child_task_plan_id], [task_template_id], [domain_id], [task_title], [score_scale_id], [planned_by], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN child_id IS NULL THEN N'child_id missing; ' ELSE N'' END, CASE WHEN [date] IS NULL THEN N'[date] missing; ' ELSE N'' END, CASE WHEN domain_id IS NULL THEN N'domain_id missing; ' ELSE N'' END, CASE WHEN task_title IS NULL THEN N'task_title missing; ' ELSE N'' END, CASE WHEN score_scale_id IS NULL THEN N'score_scale_id missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN child_task_plan_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.child_task_plans p WHERE p.id = s.child_task_plan_id) THEN N'child_task_plan_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.child_task_plans p WHERE p.id = s.child_task_plan_id); ' ELSE N'' END, CASE WHEN task_template_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_templates p WHERE p.id = s.task_template_id) THEN N'task_template_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_templates p WHERE p.id = s.task_template_id); ' ELSE N'' END, CASE WHEN domain_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id) THEN N'domain_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.domains p WHERE p.id = s.domain_id); ' ELSE N'' END, CASE WHEN score_scale_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.score_scale_id) THEN N'score_scale_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.score_scales p WHERE p.id = s.score_scale_id); ' ELSE N'' END, CASE WHEN planned_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.planned_by) THEN N'planned_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.planned_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_daily_task_assignments_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_daily_task_assignments_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_daily_task_assignments_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_daily_task_assignments_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -3193,7 +3221,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.daily_task_assignments AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_daily_task_assignments_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -3251,7 +3279,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_daily_task_assignments_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.daily_task_assignments AS tgt
@@ -3389,9 +3417,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_assessment_sessions_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_assessment_sessions_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_assessment_sessions_src
+            ([id], [child_id], [teacher_id], [center_id], [date], [started_at], [ended_at], [session_status], [general_note], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[child_id] AS [child_id],
@@ -3406,28 +3436,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[teacher_id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[started_at]), CONVERT(NVARCHAR(MAX), src.[ended_at]), CONVERT(NVARCHAR(MAX), src.[session_status]), CONVERT(NVARCHAR(MAX), src.[general_note]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.assessment_sessions src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_assessment_sessions_valid
+            ([id], [child_id], [teacher_id], [center_id], [date], [started_at], [ended_at], [session_status], [general_note], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN child_id IS NULL THEN N'child_id missing; ' ELSE N'' END, CASE WHEN teacher_id IS NULL THEN N'teacher_id missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN [date] IS NULL THEN N'[date] missing; ' ELSE N'' END, CASE WHEN session_status IS NULL THEN N'session_status missing; ' ELSE N'' END, CASE WHEN ended_at IS NOT NULL AND started_at IS NOT NULL AND started_at > ended_at THEN N'ended_at IS NOT NULL AND started_at IS NOT NULL AND started_at > ended_at; ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN teacher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id) THEN N'teacher_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id); ' ELSE N'' END, CASE WHEN center_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id) THEN N'center_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_assessment_sessions_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_assessment_sessions_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_assessment_sessions_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_assessment_sessions_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -3452,7 +3482,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.assessment_sessions AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_assessment_sessions_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -3508,7 +3538,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_assessment_sessions_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.assessment_sessions AS tgt
@@ -3646,9 +3676,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_task_assessments_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_task_assessments_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_task_assessments_src
+            ([id], [daily_task_assignment_id], [assessment_session_id], [child_id], [teacher_id], [date], [score], [normalized_score], [assessment_status], [no_score_reason_id], [attempt_no], [note], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[daily_task_assignment_id] AS [daily_task_assignment_id],
@@ -3666,28 +3698,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[daily_task_assignment_id]), CONVERT(NVARCHAR(MAX), src.[assessment_session_id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[teacher_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[score]), CONVERT(NVARCHAR(MAX), src.[normalized_score]), CONVERT(NVARCHAR(MAX), src.[assessment_status]), CONVERT(NVARCHAR(MAX), src.[no_score_reason_id]), CONVERT(NVARCHAR(MAX), src.[attempt_no]), CONVERT(NVARCHAR(MAX), src.[note]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.task_assessments src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_task_assessments_valid
+            ([id], [daily_task_assignment_id], [assessment_session_id], [child_id], [teacher_id], [date], [score], [normalized_score], [assessment_status], [no_score_reason_id], [attempt_no], [note], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN daily_task_assignment_id IS NULL THEN N'daily_task_assignment_id missing; ' ELSE N'' END, CASE WHEN assessment_session_id IS NULL THEN N'assessment_session_id missing; ' ELSE N'' END, CASE WHEN child_id IS NULL THEN N'child_id missing; ' ELSE N'' END, CASE WHEN teacher_id IS NULL THEN N'teacher_id missing; ' ELSE N'' END, CASE WHEN [date] IS NULL THEN N'[date] missing; ' ELSE N'' END, CASE WHEN assessment_status IS NULL THEN N'assessment_status missing; ' ELSE N'' END, CASE WHEN attempt_no IS NULL THEN N'attempt_no missing; ' ELSE N'' END, CASE WHEN attempt_no IS NOT NULL AND attempt_no < 1 THEN N'attempt_no IS NOT NULL AND attempt_no < 1; ' ELSE N'' END, CASE WHEN normalized_score IS NOT NULL AND (normalized_score < 0 OR normalized_score > 100) THEN N'normalized_score IS NOT NULL AND (normalized_score < 0 OR normalized_score > 100); ' ELSE N'' END, CASE WHEN daily_task_assignment_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.daily_task_assignments p WHERE p.id = s.daily_task_assignment_id) THEN N'daily_task_assignment_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.daily_task_assignments p WHERE p.id = s.daily_task_assig...; ' ELSE N'' END, CASE WHEN assessment_session_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.assessment_sessions p WHERE p.id = s.assessment_session_id) THEN N'assessment_session_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.assessment_sessions p WHERE p.id = s.assessment_session_id); ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN teacher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id) THEN N'teacher_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id); ' ELSE N'' END, CASE WHEN no_score_reason_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.no_score_reasons p WHERE p.id = s.no_score_reason_id) THEN N'no_score_reason_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.no_score_reasons p WHERE p.id = s.no_score_reason_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_task_assessments_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_task_assessments_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_task_assessments_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_task_assessments_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -3715,7 +3747,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.task_assessments AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_task_assessments_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -3777,7 +3809,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_task_assessments_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.task_assessments AS tgt
@@ -3915,9 +3947,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_notes_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_notes_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_notes_src
+            ([id], [note_scope], [center_id], [child_id], [teacher_id], [date], [daily_task_assignment_id], [task_assessment_id], [note_text], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[note_scope] AS [note_scope],
@@ -3933,28 +3967,28 @@ BEGIN
             src.[updated_at] AS [updated_at],
             COALESCE(updated_at, created_at) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[note_scope]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[teacher_id]), CONVERT(NVARCHAR(MAX), src.[date]), CONVERT(NVARCHAR(MAX), src.[daily_task_assignment_id]), CONVERT(NVARCHAR(MAX), src.[task_assessment_id]), CONVERT(NVARCHAR(MAX), src.[note_text]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.notes src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_notes_valid
+            ([id], [note_scope], [center_id], [child_id], [teacher_id], [date], [daily_task_assignment_id], [task_assessment_id], [note_text], [created_by], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN note_scope IS NULL THEN N'note_scope missing; ' ELSE N'' END, CASE WHEN note_text IS NULL THEN N'note_text missing; ' ELSE N'' END, CASE WHEN center_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id) THEN N'center_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.centers p WHERE p.id = s.center_id); ' ELSE N'' END, CASE WHEN child_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id) THEN N'child_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.children p WHERE p.id = s.child_id); ' ELSE N'' END, CASE WHEN teacher_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id) THEN N'teacher_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.teachers p WHERE p.id = s.teacher_id); ' ELSE N'' END, CASE WHEN daily_task_assignment_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.daily_task_assignments p WHERE p.id = s.daily_task_assignment_id) THEN N'daily_task_assignment_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.daily_task_assignments p WHERE p.id = s.daily_task_assig...; ' ELSE N'' END, CASE WHEN task_assessment_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_assessments p WHERE p.id = s.task_assessment_id) THEN N'task_assessment_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.task_assessments p WHERE p.id = s.task_assessment_id); ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_notes_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_notes_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_notes_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_notes_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -3980,7 +4014,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.notes AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_notes_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -4038,7 +4072,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_notes_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.notes AS tgt
@@ -4176,9 +4210,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_note_batches_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_note_batches_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_note_batches_src
+            ([id], [created_by], [note_scope], [note_text], [created_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[created_by] AS [created_by],
@@ -4187,28 +4223,28 @@ BEGIN
             src.[created_at] AS [created_at],
             created_at AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[created_by]), CONVERT(NVARCHAR(MAX), src.[note_scope]), CONVERT(NVARCHAR(MAX), src.[note_text]), CONVERT(NVARCHAR(MAX), src.[created_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.note_batches src
         WHERE created_at <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_note_batches_valid
+            ([id], [created_by], [note_scope], [note_text], [created_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN note_scope IS NULL THEN N'note_scope missing; ' ELSE N'' END, CASE WHEN note_text IS NULL THEN N'note_text missing; ' ELSE N'' END, CASE WHEN created_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by) THEN N'created_by invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.created_by); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_note_batches_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_note_batches_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_note_batches_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_note_batches_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -4227,7 +4263,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.note_batches AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_note_batches_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -4271,7 +4307,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_note_batches_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.note_batches AS tgt
@@ -4409,38 +4445,40 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_note_batch_items_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_note_batch_items_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_note_batch_items_src
+            ([id], [note_batch_id], [note_id], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[note_batch_id] AS [note_batch_id],
             src.[note_id] AS [note_id],
             SYSDATETIME() AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[note_batch_id]), CONVERT(NVARCHAR(MAX), src.[note_id]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.note_batch_items src
         WHERE EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.note_batches nb WHERE nb.id = src.note_batch_id AND nb.created_at <= @to_date)
           AND EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.notes n WHERE n.id = src.note_id AND COALESCE(n.updated_at, n.created_at) <= @to_date);
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_note_batch_items_valid
+            ([id], [note_batch_id], [note_id], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN note_batch_id IS NULL THEN N'note_batch_id missing; ' ELSE N'' END, CASE WHEN note_id IS NULL THEN N'note_id missing; ' ELSE N'' END, CASE WHEN note_batch_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.note_batches p WHERE p.id = s.note_batch_id) THEN N'note_batch_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.note_batches p WHERE p.id = s.note_batch_id); ' ELSE N'' END, CASE WHEN note_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.notes p WHERE p.id = s.note_id) THEN N'note_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.notes p WHERE p.id = s.note_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_note_batch_items_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_note_batch_items_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_note_batch_items_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_note_batch_items_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -4457,7 +4495,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.note_batch_items AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_note_batch_items_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -4497,7 +4535,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_note_batch_items_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.note_batch_items AS tgt
@@ -4635,9 +4673,11 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_audit_logs_src;
+        TRUNCATE TABLE stg_program_ops.etl_tmp_audit_logs_valid;
 
+        INSERT INTO stg_program_ops.etl_tmp_audit_logs_src
+            ([id], [user_id], [entity_name], [entity_id], [action], [old_value], [new_value], [created_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[user_id] AS [user_id],
@@ -4649,28 +4689,28 @@ BEGIN
             src.[created_at] AS [created_at],
             created_at AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[user_id]), CONVERT(NVARCHAR(MAX), src.[entity_name]), CONVERT(NVARCHAR(MAX), src.[entity_id]), CONVERT(NVARCHAR(MAX), src.[action]), CONVERT(NVARCHAR(MAX), src.[old_value]), CONVERT(NVARCHAR(MAX), src.[new_value]), CONVERT(NVARCHAR(MAX), src.[created_at]))) AS row_hash
-        INTO #src
         FROM Source_ProgramOps_DB.program_ops.audit_logs src
         WHERE created_at <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_program_ops.etl_tmp_audit_logs_valid
+            ([id], [user_id], [entity_name], [entity_id], [action], [old_value], [new_value], [created_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
             s.*,
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN entity_name IS NULL THEN N'entity_name missing; ' ELSE N'' END, CASE WHEN entity_id IS NULL THEN N'entity_id missing; ' ELSE N'' END, CASE WHEN action IS NULL THEN N'action missing; ' ELSE N'' END, CASE WHEN user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.user_id) THEN N'user_id invalid reference (SELECT 1 FROM Source_ProgramOps_DB.program_ops.users p WHERE p.id = s.user_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #valid
-        FROM #src s;
+        FROM stg_program_ops.etl_tmp_audit_logs_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #valid
+            FROM stg_program_ops.etl_tmp_audit_logs_valid
             WHERE validation_message IS NOT NULL
         );
 
-        DELETE FROM #valid
+        DELETE FROM stg_program_ops.etl_tmp_audit_logs_valid
         WHERE validation_message IS NOT NULL;
 
-        SELECT @rows_valid = COUNT(*) FROM #valid;
+        SELECT @rows_valid = COUNT(*) FROM stg_program_ops.etl_tmp_audit_logs_valid;
         -- Large/growing table: update existing changed rows, then insert new rows.
         UPDATE tgt
         SET
@@ -4692,7 +4732,7 @@ BEGIN
             tgt.is_valid = 1,
             tgt.validation_message = NULL
         FROM stg_program_ops.audit_logs AS tgt
-        INNER JOIN #valid AS src
+        INNER JOIN stg_program_ops.etl_tmp_audit_logs_valid AS src
             ON tgt.[id] = src.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -4742,7 +4782,7 @@ BEGIN
             src.row_hash,
             1,
             NULL
-        FROM #valid AS src
+        FROM stg_program_ops.etl_tmp_audit_logs_valid AS src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_program_ops.audit_logs AS tgt

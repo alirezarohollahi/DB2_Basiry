@@ -1887,6 +1887,9 @@ END;
 GO
 
 
+/*=============================================================================
+  Incremental lifecycle fact
+=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_incremental_load_dw_fact_child_snapshot_accumulation
     @start_time DATETIME2(0),
     @end_time   DATETIME2(0)
@@ -1903,7 +1906,8 @@ BEGIN
         @rows_inserted  INT = 0,
         @rows_updated   INT = 0,
         @rows_rejected  INT = 0,
-        @message        NVARCHAR(MAX) = NULL;
+        @message        NVARCHAR(MAX),
+        @error_message  NVARCHAR(MAX);
 
     IF @start_time IS NULL OR @end_time IS NULL
     BEGIN
@@ -1928,68 +1932,152 @@ BEGIN
 
         SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
 
-
         DECLARE @start_date_key INT = CONVERT(INT, CONVERT(CHAR(8), CONVERT(DATE, @start_time), 112));
-        DECLARE @end_date_key INT = CONVERT(INT, CONVERT(CHAR(8), CONVERT(DATE, @end_time), 112));
+        DECLARE @end_date_key   INT = CONVERT(INT, CONVERT(CHAR(8), CONVERT(DATE, @end_time), 112));
 
         TRUNCATE TABLE etl_work.w_fact_child_snapshot_old;
         TRUNCATE TABLE etl_work.w_fact_child_snapshot_period;
         TRUNCATE TABLE etl_work.w_fact_child_snapshot_final;
 
+        /* Keep old lifecycle rows first. */
         INSERT INTO etl_work.w_fact_child_snapshot_old
             (snapshot_date_key, child_key, center_key, teacher_key,
              planned_task_count, assessment_count, completed_task_count, scored_task_count,
              first_plan_date_key, last_plan_date_key,
              first_assessment_date_key, last_assessment_date_key,
              source_system)
-        SELECT snapshot_date_key, child_key, center_key, teacher_key,
-               planned_task_count, assessment_count, completed_task_count, scored_task_count,
-               first_plan_date_key, last_plan_date_key,
-               first_assessment_date_key, last_assessment_date_key,
-               source_system
+        SELECT
+            snapshot_date_key, child_key, center_key, teacher_key,
+            planned_task_count, assessment_count, completed_task_count, scored_task_count,
+            first_plan_date_key, last_plan_date_key,
+            first_assessment_date_key, last_assessment_date_key,
+            source_system
         FROM dw.fact_child_snapshot_accumulation;
 
+        /* New/changed lifecycle rows:
+           Counts come from latest daily snapshot in the current ETL window.
+           First/last date keys come from full transaction fact history. */
         INSERT INTO etl_work.w_fact_child_snapshot_period
             (snapshot_date_key, child_key, center_key, teacher_key,
              planned_task_count, assessment_count, completed_task_count, scored_task_count,
              first_plan_date_key, last_plan_date_key,
              first_assessment_date_key, last_assessment_date_key,
              source_system)
-        SELECT latest.max_date_key, latest.child_key, latest.center_key, latest.teacher_key,
-               ds.planned_task_count, ds.assessment_count, ds.completed_task_count, ds.scored_task_count,
-               dates.first_plan_date_key, dates.last_plan_date_key,
-               dates.first_assessment_date_key, dates.last_assessment_date_key,
-               N'PROGRAM_OPS'
-        FROM (
-            SELECT child_key, center_key, teacher_key, MAX(date_key) AS max_date_key
+        SELECT
+            latest.max_date_key,
+            latest.child_key,
+            latest.center_key,
+            latest.teacher_key,
+            ds.planned_task_count,
+            ds.assessment_count,
+            ds.completed_task_count,
+            ds.scored_task_count,
+            tx_dates.first_plan_date_key,
+            tx_dates.last_plan_date_key,
+            tx_dates.first_assessment_date_key,
+            tx_dates.last_assessment_date_key,
+            N'PROGRAM_OPS'
+        FROM
+        (
+            SELECT
+                COALESCE(child_key, -1)   AS child_key,
+                COALESCE(center_key, -1)  AS center_key,
+                COALESCE(teacher_key, -1) AS teacher_key,
+                MAX(date_key) AS max_date_key
             FROM dw.fact_daily_student_task_progress
-            WHERE date_key >= @start_date_key AND date_key < @end_date_key
-            GROUP BY child_key, center_key, teacher_key
-        ) latest
-        INNER JOIN dw.fact_daily_student_task_progress ds
-            ON ds.child_key=latest.child_key AND ds.center_key=latest.center_key AND ds.teacher_key=latest.teacher_key AND ds.date_key=latest.max_date_key
-        INNER JOIN (
-            SELECT child_key, center_key, teacher_key,
-                   MIN(CASE WHEN planned_task_count>0 THEN date_key END) AS first_plan_date_key,
-                   MAX(CASE WHEN planned_task_count>0 THEN date_key END) AS last_plan_date_key,
-                   MIN(CASE WHEN assessment_count>0 THEN date_key END) AS first_assessment_date_key,
-                   MAX(CASE WHEN assessment_count>0 THEN date_key END) AS last_assessment_date_key
-            FROM dw.fact_daily_student_task_progress
-            GROUP BY child_key, center_key, teacher_key
-        ) dates
-            ON dates.child_key=latest.child_key AND dates.center_key=latest.center_key AND dates.teacher_key=latest.teacher_key;
+            WHERE date_key >= @start_date_key
+              AND date_key <  @end_date_key
+            GROUP BY
+                COALESCE(child_key, -1),
+                COALESCE(center_key, -1),
+                COALESCE(teacher_key, -1)
+        ) AS latest
+        INNER JOIN dw.fact_daily_student_task_progress AS ds
+            ON COALESCE(ds.child_key, -1)   = latest.child_key
+           AND COALESCE(ds.center_key, -1)  = latest.center_key
+           AND COALESCE(ds.teacher_key, -1) = latest.teacher_key
+           AND ds.date_key = latest.max_date_key
+        INNER JOIN
+        (
+            SELECT
+                COALESCE(child_key, -1)   AS child_key,
+                COALESCE(center_key, -1)  AS center_key,
+                COALESCE(teacher_key, -1) AS teacher_key,
+
+                MIN(CASE
+                        WHEN source_daily_task_assignment_id IS NOT NULL
+                        THEN COALESCE(date_key, -1)
+                    END) AS first_plan_date_key,
+
+                MAX(CASE
+                        WHEN source_daily_task_assignment_id IS NOT NULL
+                        THEN COALESCE(date_key, -1)
+                    END) AS last_plan_date_key,
+
+                MIN(CASE
+                        WHEN source_task_assessment_id IS NOT NULL
+                        THEN COALESCE(date_key, -1)
+                    END) AS first_assessment_date_key,
+
+                MAX(CASE
+                        WHEN source_task_assessment_id IS NOT NULL
+                        THEN COALESCE(date_key, -1)
+                    END) AS last_assessment_date_key
+            FROM dw.fact_tran_student_task_progress
+            GROUP BY
+                COALESCE(child_key, -1),
+                COALESCE(center_key, -1),
+                COALESCE(teacher_key, -1)
+        ) AS tx_dates
+            ON tx_dates.child_key   = latest.child_key
+           AND tx_dates.center_key  = latest.center_key
+           AND tx_dates.teacher_key = latest.teacher_key;
+
+        /* Final lifecycle = recalculated current-period lifecycles
+           + old lifecycles that were not touched in this period. */
+        INSERT INTO etl_work.w_fact_child_snapshot_final
+            (snapshot_date_key, child_key, center_key, teacher_key,
+             planned_task_count, assessment_count, completed_task_count, scored_task_count,
+             first_plan_date_key, last_plan_date_key,
+             first_assessment_date_key, last_assessment_date_key,
+             source_system)
+        SELECT
+            snapshot_date_key, child_key, center_key, teacher_key,
+            planned_task_count, assessment_count, completed_task_count, scored_task_count,
+            first_plan_date_key, last_plan_date_key,
+            first_assessment_date_key, last_assessment_date_key,
+            source_system
+        FROM etl_work.w_fact_child_snapshot_period;
 
         INSERT INTO etl_work.w_fact_child_snapshot_final
-        SELECT * FROM etl_work.w_fact_child_snapshot_period;
-
-        INSERT INTO etl_work.w_fact_child_snapshot_final
-        SELECT old.*
-        FROM etl_work.w_fact_child_snapshot_old old
-        LEFT JOIN etl_work.w_fact_child_snapshot_period p
-            ON p.child_key=old.child_key AND p.center_key=old.center_key AND p.teacher_key=old.teacher_key
+            (snapshot_date_key, child_key, center_key, teacher_key,
+             planned_task_count, assessment_count, completed_task_count, scored_task_count,
+             first_plan_date_key, last_plan_date_key,
+             first_assessment_date_key, last_assessment_date_key,
+             source_system)
+        SELECT
+            old.snapshot_date_key,
+            old.child_key,
+            old.center_key,
+            old.teacher_key,
+            old.planned_task_count,
+            old.assessment_count,
+            old.completed_task_count,
+            old.scored_task_count,
+            old.first_plan_date_key,
+            old.last_plan_date_key,
+            old.first_assessment_date_key,
+            old.last_assessment_date_key,
+            old.source_system
+        FROM etl_work.w_fact_child_snapshot_old AS old
+        LEFT JOIN etl_work.w_fact_child_snapshot_period AS p
+            ON COALESCE(p.child_key, -1)   = COALESCE(old.child_key, -1)
+           AND COALESCE(p.center_key, -1)  = COALESCE(old.center_key, -1)
+           AND COALESCE(p.teacher_key, -1) = COALESCE(old.teacher_key, -1)
         WHERE p.child_key IS NULL;
 
-        SELECT @rows_read=COUNT(*) FROM etl_work.w_fact_child_snapshot_final;
+        SELECT @rows_read = COUNT(*)
+        FROM etl_work.w_fact_child_snapshot_final;
 
         TRUNCATE TABLE dw.fact_child_snapshot_accumulation;
         DBCC CHECKIDENT ('dw.fact_child_snapshot_accumulation', RESEED, 0) WITH NO_INFOMSGS;
@@ -2000,16 +2088,16 @@ BEGIN
              first_plan_date_key, last_plan_date_key,
              first_assessment_date_key, last_assessment_date_key,
              source_system, etl_batch_id, loaded_at)
-        SELECT snapshot_date_key, child_key, center_key, teacher_key,
-               planned_task_count, assessment_count, completed_task_count, scored_task_count,
-               first_plan_date_key, last_plan_date_key,
-               first_assessment_date_key, last_assessment_date_key,
-               source_system, @etl_batch_id, SYSDATETIME()
+        SELECT
+            snapshot_date_key, child_key, center_key, teacher_key,
+            planned_task_count, assessment_count, completed_task_count, scored_task_count,
+            first_plan_date_key, last_plan_date_key,
+            first_assessment_date_key, last_assessment_date_key,
+            source_system, @etl_batch_id, SYSDATETIME()
         FROM etl_work.w_fact_child_snapshot_final;
 
-        SET @rows_inserted=@@ROWCOUNT;
-        SET @message=N'Incremental lifecycle fact rebuilt through etl_work tables: old lifecycle plus current period snapshot result, then target truncated and reinserted.';
-
+        SET @rows_inserted = @@ROWCOUNT;
+        SET @message = N'Incremental lifecycle fact rebuilt from latest daily snapshot counts and transaction-fact first/last dates.';
 
         INSERT INTO etl_admin.etl_load_log
             (etl_batch_id, source_database, source_schema, source_table,
@@ -2017,7 +2105,7 @@ BEGIN
              rows_read, rows_inserted, rows_updated, rows_rejected,
              started_at, ended_at, message)
         VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_daily_student_task_progress',
+            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_daily_student_task_progress/fact_tran_student_task_progress',
              N'Charity_DW_DB', N'dw', N'fact_child_snapshot_accumulation', N'succeeded',
              @rows_read, @rows_inserted, @rows_updated, @rows_rejected,
              @started_at, SYSDATETIME(), @message);
@@ -2034,7 +2122,7 @@ BEGIN
         WHERE etl_batch_id = @etl_batch_id;
     END TRY
     BEGIN CATCH
-        SET @message = CONCAT(N'Error ', ERROR_NUMBER(), N' at line ', ERROR_LINE(), N': ', ERROR_MESSAGE());
+        SET @error_message = CONCAT(N'Error ', ERROR_NUMBER(), N' at line ', ERROR_LINE(), N': ', ERROR_MESSAGE());
 
         IF @etl_batch_id IS NOT NULL
         BEGIN
@@ -2044,10 +2132,10 @@ BEGIN
                  rows_read, rows_inserted, rows_updated, rows_rejected,
                  started_at, ended_at, message)
             VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_daily_student_task_progress',
+                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_daily_student_task_progress/fact_tran_student_task_progress',
                  N'Charity_DW_DB', N'dw', N'fact_child_snapshot_accumulation', N'failed',
                  @rows_read, @rows_inserted, @rows_updated, @rows_rejected,
-                 @started_at, SYSDATETIME(), @message);
+                 @started_at, SYSDATETIME(), @error_message);
 
             UPDATE etl_admin.etl_batch
             SET
@@ -2057,7 +2145,7 @@ BEGIN
                 rows_inserted = @rows_inserted,
                 rows_updated  = @rows_updated,
                 rows_rejected = @rows_rejected,
-                error_message = @message
+                error_message = @error_message
             WHERE etl_batch_id = @etl_batch_id;
         END;
 
