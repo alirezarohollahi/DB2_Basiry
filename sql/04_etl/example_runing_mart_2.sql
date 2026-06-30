@@ -74,16 +74,18 @@ ORDER BY etl_load_log_id DESC;
 
 =============================================================================*/
 -- --- first load
+-- declare @start_time DATETIME2(0);
+-- declare @end_time DATETIME2(0);
+-- set @start_time = getdate()-360;
+-- set @end_time = getdate()+360;
 -- EXEC Charity_DW_DB.etl_admin.usp_first_load_dw_finance_mart2_all
---      @start_time  = getdate(),
---      @end_time    = GETDATE()+1,
---      @run_staging = 1;
+--      @start_time,
+--      @end_time ;
 --- asyn varibles 
 declare @job_start_time DATETIME2(0);
 declare @job_end_time DATETIME2(0);
-set @job_start_time = getdate()+30;
-set @job_end_time = getdate()+60;
+set @job_start_time = getdate()-720;
+set @job_end_time = getdate()-360;
 EXEC Charity_DW_DB.etl_admin.usp_load_dw_finance_mart2_daily
      @start_time  = @job_start_time,
-     @end_time    = @job_end_time,
-     @run_staging = 1;
+     @end_time    = @job_end_time;

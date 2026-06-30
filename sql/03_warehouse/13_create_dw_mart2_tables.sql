@@ -28,6 +28,10 @@
  MART 2 grain and scope:
    - fact_donation_transaction:
        One row per donation transaction.
+   - fact_expense_transaction:
+       One row per approved/pending/rejected expense transaction.
+   - fact_payment_transaction:
+       One row per salary/bonus/vendor/refund payment transaction.
    - fact_monthly_financial_snapshot:
        One row per month / center financial summary.
    - fact_donation_lifecycle:
@@ -94,6 +98,8 @@ GO
 DROP TABLE IF EXISTS dw.fact_budget_allocation_event;
 DROP TABLE IF EXISTS dw.fact_donation_lifecycle;
 DROP TABLE IF EXISTS dw.fact_monthly_financial_snapshot;
+DROP TABLE IF EXISTS dw.fact_payment_transaction;
+DROP TABLE IF EXISTS dw.fact_expense_transaction;
 DROP TABLE IF EXISTS dw.fact_donation_transaction;
 
 DROP TABLE IF EXISTS dw.dim_allocation_type;
@@ -281,6 +287,51 @@ CREATE TABLE dw.fact_donation_transaction (
 );
 GO
 
+CREATE TABLE dw.fact_expense_transaction (
+    expense_transaction_key BIGINT IDENTITY(1,1) NOT NULL,
+    date_key                INT NULL,
+    center_key              INT NULL,
+    child_key               INT NULL,
+    category_key            INT NULL,
+    currency_key            INT NULL,
+    status_key              INT NULL,
+
+    amount                  DECIMAL(18,2) NULL,
+    is_approved             BIT NULL,
+    is_rejected             BIT NULL,
+    description             NVARCHAR(2000) NULL,
+
+    source_expense_id       BIGINT NULL,
+    source_center_id        BIGINT NULL,
+    source_child_id         BIGINT NULL,
+    source_category_id      BIGINT NULL,
+    source_system           NVARCHAR(100) NULL,
+    etl_batch_id            INT NULL,
+    loaded_at               DATETIME2(0) NULL
+);
+GO
+
+CREATE TABLE dw.fact_payment_transaction (
+    payment_transaction_key BIGINT IDENTITY(1,1) NOT NULL,
+    date_key                INT NULL,
+    center_key              INT NULL,
+    currency_key            INT NULL,
+    status_key              INT NULL,
+
+    payment_type            NVARCHAR(50) NULL,
+    source_teacher_id       BIGINT NULL,
+    amount                  DECIMAL(18,2) NULL,
+    is_paid                 BIT NULL,
+    is_cancelled            BIT NULL,
+
+    source_payment_id       BIGINT NULL,
+    source_center_id        BIGINT NULL,
+    source_system           NVARCHAR(100) NULL,
+    etl_batch_id            INT NULL,
+    loaded_at               DATETIME2(0) NULL
+);
+GO
+
 CREATE TABLE dw.fact_monthly_financial_snapshot (
     monthly_financial_snapshot_key BIGINT IDENTITY(1,1) NOT NULL,
     month_key                      INT NULL,
@@ -359,6 +410,14 @@ GO
 --     ON dw.fact_donation_transaction;
 -- GO
 
+-- CREATE CLUSTERED COLUMNSTORE INDEX CCI_fact_expense_transaction
+--     ON dw.fact_expense_transaction;
+-- GO
+--
+-- CREATE CLUSTERED COLUMNSTORE INDEX CCI_fact_payment_transaction
+--     ON dw.fact_payment_transaction;
+-- GO
+--
 -- CREATE CLUSTERED COLUMNSTORE INDEX CCI_fact_monthly_financial_snapshot
 --     ON dw.fact_monthly_financial_snapshot;
 -- GO

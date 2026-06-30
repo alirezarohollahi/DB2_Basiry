@@ -1,0 +1,386 @@
+خوب الان میخوایم پورسه مخصوص ... را بنویسیمبه نکات زیر توجه زیادی کن :
+
+1. نکات عمومی ETL
+هر procedure باید @start_time و @end_time داشته باشد.
+
+بازه زمانی بهتر است به شکل نیمه‌باز باشد:
+
+@start_time <= data_time < @end_time
+
+این کار باعث می‌شود daily jobها روی هم نیفتند و duplicate نسازند.
+
+همه‌ی tableها باید unknown row با key برابر -1 داشته باشند.
+
+در factها اگر dimension lookup پیدا نشد، نباید ETL fail شود؛ باید key مربوطه -1 شود.
+
+لاگ باید در همان دیتابیس DW نوشته شود، نه staging.
+
+لاگ باید step-level باشد، نه row-level.
+
+یعنی برای هر عملیات مثل insert into temp، insert into fact، update dimension یک رکورد log کافی است.
+
+نباید برای هر رکورد دیتا یک log row ساخته شود.
+
+etl_batch باید فقط summary نهایی business operation را نگه دارد.
+
+etl_load_log می‌تواند stepهای داخلی را نگه دارد.
+
+rows_read, rows_inserted, rows_updated, rows_rejected باید معنی واقعی داشته باشند.
+
+از MERGE استفاده نکنیم چون در SQL Server برای ETL production گاهی risky و سخت-debug است.
+
+از window function استفاده نکنیم مگر واقعاً لازم باشد؛ برای performance و سادگی بهتر است حذف شود.
+
+از delete/reloadهای سنگین و خطرناک پرهیز کنیم.
+
+برای load عادی، بهتر است pattern اصلی این باشد:
+
+detect affected records
+update changed records
+insert new records
+
+برای first load می‌توان aggressiveتر عمل کرد، ولی باز هم باید unknown row حفظ شود.
+
+ترتیب اجرای ETL مهم است:
+
+dimensions first
+transaction facts
+snapshot facts
+lifecycle / accumulating facts
+orchestration
+
+2. دایمنشن‌ها — General Dimension Rules
+
+دایمنشن‌ها معمولاً نیاز به loop روزانه ندارند.
+
+برای dimensionها نباید از WHILE روی روزها استفاده شود.
+
+دایمنشن‌ها باید set-based load شوند.
+
+برای تشخیص insert/update می‌توان staging و dim را با FULL JOIN یا LEFT JOIN مقایسه کرد.
+
+شرط تغییر بهتر است با row_hash باشد.
+
+اگر source record جدید بود، insert شود.
+
+اگر source record موجود بود ولی row_hash تغییر کرده بود، update شود.
+
+اگر هیچ تغییری نبود، کاری انجام نشود.
+
+unknown row با key -1 هیچ‌وقت نباید update/delete شود.
+
+قبل از first load، identity یا sequence بهتر است reset شود.
+
+قبل از incremental load، identity بهتر است با MAX(key) + interval هماهنگ شود.
+
+دایمنشن‌ها نباید با date range خیلی محدود طوری load شوند که factها به -1 بخورند.
+
+قبل از fact load باید مطمئن شویم dimensionهای لازم برای داده‌های همان بازه load شده‌اند.
+
+3. SCD Type 1 Dimension
+
+مثل:
+
+dim_donor
+dim_campaign
+dim_category
+dim_donation_type
+dim_status
+dim_currency
+dim_allocation_type
+
+وقتی attribute تغییر کند، رکورد قبلی overwrite می‌شود.
+
+تاریخچه تغییرات نگهداری نمی‌شود.
+
+ستون‌هایی مثل effective_from, effective_to, is_current لازم نیست.
+
+تشخیص تغییر بهتر است با row_hash باشد.
+
+pattern مناسب:
+
+source exists, dim does not exist -> insert
+source exists, dim exists, hash changed -> update
+source exists, dim exists, hash same -> no action
+
+برای Type 1، update current state طبیعی است و risky نیست، چون طراحی خود dimension همین است.
+
+اما update باید فقط روی رکوردهای matched و changed انجام شود.
+
+نباید کل dimension را truncate کنیم، مخصوصاً در incremental.
+
+در first load هم اگر truncate می‌کنیم، باید unknown row دوباره insert شود.
+
+برای reference dimensionهای کوچک مثل status/currency/type، distinct values از staging کافی است.
+
+برای status بهتر است natural key فقط code نباشد؛ باید status_type + code باشد، چون مثلاً pending در donation و payment معنی متفاوت دارد.
+
+4. SCD Type 2 Dimension
+
+در پروژه فعلی ما هنوز Type 2 واقعی نداریم، ولی نکاتش این است:
+
+اگر dimension ستون‌های زیر را داشته باشد، احتمالاً Type 2 است:
+
+effective_from
+effective_to
+is_current
+version_number
+
+در Type 2 نباید رکورد قبلی overwrite شود.
+
+وقتی attribute تاریخی تغییر کند:
+
+old current row -> is_current = 0, effective_to = change_date
+new row -> insert with is_current = 1
+
+برای Type 2، fact باید به نسخه درست dimension در زمان transaction وصل شود.
+
+join fact به dimension باید با date هم باشد، نه فقط business key.
+
+برای Type 2، row_hash باید فقط attributeهای تاریخی را پوشش دهد.
+
+تغییر attribute غیرتاریخی می‌تواند Type 1 داخل Type 2 باشد.
+
+Type 2 سنگین‌تر است و برای هر dimension لازم نیست.
+
+برای دایمنشن های نوع 3 نیز بسته به نیاز باید مثل دامنشن نوع 2 عمل کرد اما نباید رکورد جدیدی اضافه کرد بلکه ان رکورد را اپدیت و فیلد های گذشته را نیز تغییر داد
+
+5. Static / Reference Dimension
+
+معمولاً تعداد رکورد کم است.
+
+نیازی به loop زمانی ندارد.
+
+از distinct values در staging ساخته می‌شود.
+
+باید normalize شود:trimlowercase coderemove empty values
+
+unknown row باید همیشه وجود داشته باشد.
+
+اگر مقدار جدید در source دیده شد، insert شود.
+
+اگر title یا description تغییر کرد، update شود.
+
+بهتر است codeها controlled باشند تا dimension بی‌نظم نشود.
+
+6. Hierarchical Dimension
+
+اگر parent-child دارد، باید parent هم resolve شود.
+
+اگر parent هنوز load نشده بود، parent info می‌تواند موقتاً unknown/null باشد.
+
+در incremental بعدی باید parent دوباره resolve شود.
+
+باید مراقب self-reference یا parent missing باشیم.
+
+برای performance بهتر است hierarchy خیلی پیچیده را در ETL با recursive query سنگین نسازیم، مگر واقعاً لازم باشد.
+
+برای سطح ساده category، join مستقیم کافی است.
+
+اگر hierarchy عمیق شد، بهتر است bridge table یا flattened columns طراحی شود.
+
+7. Conformed Dimension
+
+این dimensionها بین چند mart مشترک هستند.
+
+اگر dim_center یا dim_child کامل نباشد، factها center_key = -1 یا child_key = -1 می‌گیرند.
+
+dim_date باید از قبل برای کل بازه ETL پر شده باشد.
+
+اگر date در dim_date نباشد، fact date_key = -1 می‌شود.
+
+برای dim_date، procedure جداگانه لازم است که از start date تا end date روزانه یک رکورد بسازد.
+
+dim_date بهتر است idempotent باشد؛ اگر تاریخ وجود داشت update کند، اگر نبود insert کند.
+
+8. Transaction Fact
+
+grain باید واضح باشد:
+
+one row per source transaction
+
+این factها accumulating نیستند.
+
+هر row یک event/transaction مستقل است.
+
+در incremental نباید کل fact را reload کنیم.
+
+نباید risky delete/reload گسترده انجام دهیم.
+
+pattern بهتر:source transaction exists, fact does not exist -> insertsource transaction exists, fact exists and changed -> updatesource transaction unchanged -> no action
+
+date key باید با join مستقیم به dim_date resolve شود.
+
+center key باید با join مستقیم به dim_center resolve شود.
+
+lookup temp table جدا برای date/center لازم نیست.
+
+اگر dimension resolve نشد، key باید -1 شود.
+
+transaction fact باید بر اساس date partition-friendly باشد.
+
+یعنی شرط‌های ETL باید روی date_key یا تاریخ transaction قابل استفاده باشند.
+
+snapshot fact باید تا جای ممکن از این transaction factها بخواند، نه مستقیم از source/staging.
+
+9. Event Fact (fact-less fact)
+
+معمولا برای مشخص رابطه بین دو موجودیت استفاده میشود
+
+شبیه transaction fact است، ولی نماینده یک رخداد business است.
+
+accumulating نیست.
+
+نباید از ابتدا تا انتها recalculation شود.
+
+در incremental فقط affected allocationها insert/update شوند.
+
+این fact هم باید partition-friendly بر اساس date_key باشد.
+
+10. Periodic Snapshot Fact
+
+این fact نماینده وضعیت در یک دوره زمانی است.
+
+باید طبق grain باشد به عنوان مثال :
+
+one row per month per center
+
+ممکن است grain روزانه نیز باشد انگاه به ازا هر روز یک رکورد لازم است
+
+این fact باید loop داشته باشد، چون ماه به ماه snapshot ساخته می‌شود.
+
+WHILE فقط برای snapshot fact قابل قبول است.(باید از while استفاده شود)
+
+snapshot نباید مستقیماً از source fact بخواند.
+
+snapshot باید از factهای transaction/event بخواند.
+
+در incremental، اگر یک transaction قدیمی امروز update شد، ماه(یا روز) مربوط به تاریخ transaction باید دوباره ساخته شود.
+
+چون snapshot با month_key کار می‌کند، partition-friendly بودن آن باید روی month_key باشد.
+
+snapshot باید بتواند ماه‌هایی را بسازد که expense/payment دارند ولی donation ندارند.
+
+snapshot باید بتواند centerهایی را بسازد که فقط allocation دارند.
+
+اگر dim_center ناقص باشد، centerها ممکن است زیر center_key = -1 جمع شوند.
+
+11. Accumulating Snapshot Fact
+
+این fact وضعیت lifecycle یک business process را نگه می‌دارد.
+
+grain:
+
+one row per lifecycle
+
+این fact معمولاً  date key ندارد
+
+این fact برخلاف transaction fact باید update شود.
+
+اما update آن risky نیست، چون design خودش current lifecycle state است.
+
+incremental window فقط affected donationها را پیدا می‌کند.
+
+محاسبه lifecycle باید از کل داده‌های موجود همان donation انجام شود، نه فقط بازه incremental.
+
+یعنی:
+
+time window -> detect affected donations
+full available history -> recalculate lifecycle state
+
+در محاسبه میتوان از رکورد های قبلی همین فکت نیز استفاده کرد
+
+lifecycle fact باید idempotent باشد.
+
+rerun نباید duplicate lifecycle row بسازد.
+
+12. Fact Table Partitioning
+
+partition فیزیکی در SQL Server فقط با ETL حل نمی‌شود.
+
+partition باید در create table / index / partition scheme تعریف شود.
+
+ولی ETL باید partition-friendly نوشته شود.
+
+برای transaction/event facts، partition key بهتر است:
+
+date_key
+
+برای monthly snapshot:
+
+month_key
+
+شرط‌های ETL باید روی همین keyها یا تاریخ متناظرشان باشد.
+
+اگر query روی function-wrapped date باشد، partition elimination ممکن است کار نکند.
+
+باید از شرط‌های range-based استفاده شود.
+
+برای loadهای بزرگ، بهتر است affected periodها جداگانه پردازش شوند.
+
+اگر partition واقعی اضافه شد، می‌توان بعداً switch partition یا truncate partition را بررسی کرد.
+
+اما فعلاً نباید delete گسترده روی کل fact داشته باشیم.
+
+13. Logging Rules
+
+لاگ باید در DW باشد:
+
+Charity_DW_DB.etl_admin.etl_batch
+Charity_DW_DB.etl_admin.etl_load_log
+
+etl_batch باید summary سطح procedure باشد.
+
+etl_load_log باید step-level باشد.
+
+لاگ نباید row-level باشد.
+
+برای temp stepها می‌توان log زد، ولی نباید summary batch را inflate کند.
+
+summary batch باید فقط business row counts را نشان دهد.
+
+برای dimension:
+
+rows_read = source candidates
+rows_inserted = inserted dimension rows
+rows_updated = updated dimension rows
+rows_rejected = invalid/rejected rows
+
+برای fact:
+
+rows_read = source/fact candidate rows
+rows_inserted = inserted fact rows
+rows_updated = updated fact rows
+rows_rejected = unresolved/invalid critical rows
+
+اگر lookup dimension پیدا نشد ولی fact با -1 load شد، معمولاً rejected نیست.
+
+rejected زمانی است که رکورد اصلاً قابل load نباشد.
+
+created_by در etl_batch باید مقدار داشته باشد.
+
+در پایان procedure باید ended_at و batch_status update شود.
+
+در failure باید error message ذخیره شود.
+
+14. Execution Order
+
+15. خلاصه خیلی مهم
+
+کمترین loop
+کمترین temp غیرضروری
+join مستقیم با dimension
+بدون window function
+بدون merge
+بدون delete گسترده
+load فقط affected data
+partition-friendly predicates
+توجه خیلی خیلی زیاد به نوع فکت یا دایمنشن 
+
+
+each procedure must have a start and end time as an input arg  that update dimentions or fact in that period
+
+At the beginning of the load first ETL, it is better to reset the sequence to the initial value, and at the beginning of the incremental ETL, we can also reset it to max(the value used) + interval.
+
+you must give me two procedure one for first load and next for normal phases
+

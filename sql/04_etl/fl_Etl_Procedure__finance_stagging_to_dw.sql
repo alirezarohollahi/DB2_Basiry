@@ -1,5 +1,175 @@
+
+/*
+===============================================================================
+ Finance MART 2 FIRST LOAD ETL - Rule-Based Rewrite
+
+ Rules applied in this version:
+   - No SQL Server session temp tables are used.
+   - Work tables are permanent DW tables in etl_work schema and are TRUNCATEd.
+   - Type 1 dimensions use: build work table -> TRUNCATE dimension -> INSERT.
+   - Facts do not use UPDATE.
+   - Transaction/event/factless-style facts are append-only and avoid duplicates.
+   - Monthly snapshot is append-only and is the only WHILE-loop based fact.
+   - Monthly snapshot reads DW fact tables, not source/staging transaction tables.
+   - Donation lifecycle rebuilds by using old lifecycle fact + new calculated lifecycle rows.
+   - Unknown rows are not checked; they are assumed by DW creation and reloaded for Type 1 dimensions after truncate.
+===============================================================================
+*/
+
 USE Charity_DW_DB;
 GO
+
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl_admin')
+BEGIN
+    EXEC(N'CREATE SCHEMA etl_admin');
+END
+GO
+
+
+CREATE OR ALTER PROCEDURE etl_admin.usp_assert_finance_mart2_prerequisites
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dw.dim_date', N'U') IS NULL AND OBJECT_ID(N'dw.DimDate', N'U') IS NULL
+        THROW 52001, 'Missing DW date dimension.', 1;
+
+    IF OBJECT_ID(N'dw.dim_center', N'U') IS NULL
+        THROW 52002, 'Missing dw.dim_center.', 1;
+
+    IF OBJECT_ID(N'dw.dim_child', N'U') IS NULL
+        THROW 52003, 'Missing dw.dim_child.', 1;
+
+    IF OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.donors', N'U') IS NULL
+        THROW 52004, 'Missing staging finance tables.', 1;
+
+    IF OBJECT_ID(N'etl_work.tmp_dim_donor_load', N'U') IS NULL
+        THROW 52005, 'Missing etl_work temp/work tables. Run 30_create_dw_finance_etl_work_tables.sql first.', 1;
+END
+GO
+
+CREATE OR ALTER PROCEDURE etl_admin.usp_dw_start_batch
+      @target_layer NVARCHAR(100),
+      @mart_name    NVARCHAR(100) = N'FINANCE_MART2',
+      @etl_batch_id INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO Charity_DW_DB.etl_admin.etl_batch
+    (
+          source_system,
+          target_layer,
+          mart_name,
+          batch_status,
+          started_at,
+          rows_read,
+          rows_inserted,
+          rows_updated,
+          rows_rejected,
+          created_by
+    )
+    VALUES
+    (
+          N'FINANCE_OPS',
+          @target_layer,
+          @mart_name,
+          N'running',
+          SYSDATETIME(),
+          0,
+          0,
+          0,
+          0,
+          COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL')
+    );
+
+    SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
+END
+GO
+
+CREATE OR ALTER PROCEDURE etl_admin.usp_dw_log_step
+      @etl_batch_id    INT,
+      @source_table    NVARCHAR(128),
+      @target_table    NVARCHAR(128),
+      @load_status     NVARCHAR(50),
+      @rows_read       INT = 0,
+      @rows_inserted   INT = 0,
+      @rows_updated    INT = 0,
+      @rows_rejected   INT = 0,
+      @started_at      DATETIME2(0) = NULL,
+      @message         NVARCHAR(MAX) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
+    (
+          etl_batch_id,
+          source_database,
+          source_schema,
+          source_table,
+          target_database,
+          target_schema,
+          target_table,
+          load_status,
+          rows_read,
+          rows_inserted,
+          rows_updated,
+          rows_rejected,
+          started_at,
+          ended_at,
+          message
+    )
+    VALUES
+    (
+          @etl_batch_id,
+          N'Stg_FinanceOps_DB',
+          N'stg_finance_ops',
+          @source_table,
+          N'Charity_DW_DB',
+          N'dw',
+          @target_table,
+          @load_status,
+          @rows_read,
+          @rows_inserted,
+          @rows_updated,
+          @rows_rejected,
+          ISNULL(@started_at, SYSDATETIME()),
+          SYSDATETIME(),
+          @message
+    );
+END
+GO
+
+CREATE OR ALTER PROCEDURE etl_admin.usp_dw_finish_batch
+      @etl_batch_id    INT,
+      @batch_status    NVARCHAR(50),
+      @rows_read       INT = 0,
+      @rows_inserted   INT = 0,
+      @rows_updated    INT = 0,
+      @rows_rejected   INT = 0,
+      @error_message   NVARCHAR(MAX) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE Charity_DW_DB.etl_admin.etl_batch
+       SET batch_status  = @batch_status,
+           ended_at       = SYSDATETIME(),
+           rows_read      = ISNULL(@rows_read, 0),
+           rows_inserted  = ISNULL(@rows_inserted, 0),
+           rows_updated   = ISNULL(@rows_updated, 0),
+           rows_rejected  = ISNULL(@rows_rejected, 0),
+           error_message  = @error_message
+     WHERE etl_batch_id = @etl_batch_id;
+END
+GO
+
 
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_donor
       @start_time DATETIME2(0),
@@ -9,568 +179,65 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE
-          @etl_batch_id BIGINT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_deleted INT,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52001, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52002, '@start_time must be earlier than @end_time.', 1;
-    END;
+    DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @step_started DATETIME2(0);
+    EXEC etl_admin.usp_dw_start_batch @target_layer=N'DW_DIMENSION', @mart_name=N'FINANCE_MART2', @etl_batch_id=@etl_batch_id OUTPUT;
 
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
+        SET @step_started = SYSDATETIME();
+        TRUNCATE TABLE etl_work.tmp_dim_donor_load;
 
-        SET @etl_batch_id = SCOPE_IDENTITY();
+        INSERT INTO etl_work.tmp_dim_donor_load
+        (existing_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+        VALUES (-1, -1, N'Unknown', N'unknown', 0, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
 
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donors',
-             N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_donor. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
+        ;WITH src AS (
+            SELECT id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at
+            FROM Stg_FinanceOps_DB.stg_finance_ops.donors
+            WHERE is_valid = 1 AND id IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_donor_load
+        (existing_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+        SELECT d.donor_key, s.id, s.full_name, s.donor_type, s.is_active, s.source_system, s.row_hash, s.created_at, s.updated_at
+        FROM src s
+        FULL JOIN dw.dim_donor d ON d.donor_id = s.id AND d.donor_key <> -1
+        WHERE s.id IS NOT NULL;
 
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              donor_id          INT NOT NULL PRIMARY KEY,
-              full_name         NVARCHAR(250) NULL,
-              donor_type        NVARCHAR(50) NULL,
-              is_active         BIT NULL,
-              source_system     NVARCHAR(100) NULL,
-              row_hash          VARBINARY(32) NULL,
-              created_at        DATETIME2(0) NULL,
-              updated_at        DATETIME2(0) NULL,
-              source_updated_at DATETIME2(0) NULL,
-              stg_row_id        BIGINT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donors',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #donor_work
-        (
-              donor_id          INT NOT NULL PRIMARY KEY,
-              full_name         NVARCHAR(250) NULL,
-              donor_type        NVARCHAR(50) NULL,
-              is_active         BIT NULL,
-              source_system     NVARCHAR(100) NULL,
-              row_hash          VARBINARY(32) NULL,
-              created_at        DATETIME2(0) NULL,
-              updated_at        DATETIME2(0) NULL,
-              source_updated_at DATETIME2(0) NULL,
-              stg_row_id        BIGINT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donors',
-             N'tempdb', N'#', N'#donor_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #donor_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  donor_id,
-                  full_name,
-                  donor_type,
-                  is_active,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  s.id,
-                  s.full_name,
-                  s.donor_type,
-                  s.is_active,
-                  s.source_system,
-                  s.row_hash,
-                  s.created_at,
-                  s.updated_at,
-                  COALESCE(s.source_updated_at, s.updated_at, s.created_at),
-                  s.stg_row_id
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donors AS s
-            WHERE s.is_valid = 1
-              AND s.id IS NOT NULL
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) >= @current_from
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) <  @current_to
-              AND NOT EXISTS
-              (
-                    SELECT 1
-                    FROM Stg_FinanceOps_DB.stg_finance_ops.donors AS s2
-                    WHERE s2.is_valid = 1
-                      AND s2.id = s.id
-                      AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) >= @current_from
-                      AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) <  @current_to
-                      AND
-                      (
-                           COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at)
-                               > COALESCE(s.source_updated_at, s.updated_at, s.created_at)
-                           OR
-                           (
-                               COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at)
-                                   = COALESCE(s.source_updated_at, s.updated_at, s.created_at)
-                               AND s2.stg_row_id > s.stg_row_id
-                           )
-                      )
-              );
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donors',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted daily donor rows into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.full_name         = s.full_name,
-                   w.donor_type        = s.donor_type,
-                   w.is_active         = s.is_active,
-                   w.source_system     = s.source_system,
-                   w.row_hash          = s.row_hash,
-                   w.created_at        = s.created_at,
-                   w.updated_at        = s.updated_at,
-                   w.source_updated_at = s.source_updated_at,
-                   w.stg_row_id        = s.stg_row_id
-            FROM #donor_work AS w
-            INNER JOIN #loop_src AS s
-                    ON s.donor_id = w.donor_id
-            WHERE s.source_updated_at > w.source_updated_at
-               OR (s.source_updated_at = w.source_updated_at AND s.stg_row_id > w.stg_row_id);
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donor_work',
-                 N'succeeded', @rows_loop_inserted, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Updated existing rows in #donor_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #donor_work
-            (
-                  donor_id,
-                  full_name,
-                  donor_type,
-                  is_active,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  s.donor_id,
-                  s.full_name,
-                  s.donor_type,
-                  s.is_active,
-                  s.source_system,
-                  s.row_hash,
-                  s.created_at,
-                  s.updated_at,
-                  s.source_updated_at,
-                  s.stg_row_id
-            FROM #loop_src AS s
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #donor_work AS w
-                WHERE w.donor_id = s.donor_id
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donor_work',
-                 N'succeeded', @rows_loop_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted new rows into #donor_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
+        SELECT @rows_read = COUNT(*) FROM etl_work.tmp_dim_donor_load WHERE donor_id <> -1;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donors', N'dim_donor', N'work_ready', @rows_read, 0, 0, 0, @step_started, N'Type 1 dimension work table prepared with FULL JOIN.';
 
         BEGIN TRANSACTION;
-
             TRUNCATE TABLE dw.dim_donor;
 
             SET IDENTITY_INSERT dw.dim_donor ON;
-
             INSERT INTO dw.dim_donor
-            (
-                  donor_key,
-                  donor_id,
-                  full_name,
-                  donor_type,
-                  is_active,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  -1,
-                  N'Unknown',
-                  N'unknown',
-                  0,
-                  N'FINANCE_OPS',
-                  NULL,
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            (donor_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+            SELECT existing_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_donor_load
+            WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_donor OFF;
 
-            DBCC CHECKIDENT ('dw.dim_donor', RESEED, 0) WITH NO_INFOMSGS;
-
             INSERT INTO dw.dim_donor
-            (
-                  donor_id,
-                  full_name,
-                  donor_type,
-                  is_active,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.donor_id,
-                  w.full_name,
-                  w.donor_type,
-                  w.is_active,
-                  w.source_system,
-                  w.row_hash,
-                  w.created_at,
-                  w.updated_at
-            FROM #donor_work AS w;
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
+            (donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+            SELECT donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_donor_load
+            WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
         COMMIT TRANSACTION;
 
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'succeeded', NULL, NULL,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(), N'Truncated dw.dim_donor for first load.');
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'constant', N'unknown_row', N'dim_donor',
-             N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'succeeded', 1, @rows_unknown_inserted,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(), N'Inserted unknown donor row with donor_key = -1.');
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'succeeded', 0, 0,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(), N'Reset dim_donor identity seed to 0; next real donor_key starts from 1.');
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#donor_work',
-             N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'succeeded', @rows_work_inserted_total, @rows_dim_inserted,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(), N'Inserted business donor rows into dw.dim_donor.');
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_dim_inserted + @rows_unknown_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(N'First load succeeded. Staging rows read: ', @rows_read_total,
-                                      N'; work inserted: ', @rows_work_inserted_total,
-                                      N'; work updated: ', @rows_work_updated_total,
-                                      N'; dimension inserted: ', @rows_dim_inserted,
-                                      N'; unknown inserted: ', @rows_unknown_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'etl_work.tmp_dim_donor_load', N'dim_donor', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 dimension refreshed by truncate + insert.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-        BEGIN
-            IF OBJECT_ID('dw.dim_donor', 'U') IS NOT NULL
-            BEGIN
-                BEGIN TRY
-                    SET IDENTITY_INSERT dw.dim_donor OFF;
-                END TRY
-                BEGIN CATCH
-                END CATCH;
-            END;
-
-            ROLLBACK TRANSACTION;
-        END;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   rows_read     = @rows_read_total,
-                   rows_inserted  = ISNULL(@rows_dim_inserted, 0) + ISNULL(@rows_unknown_inserted, 0),
-                   rows_rejected = 0,
-                   ended_at      = SYSDATETIME(),
-                   message       = @error_message
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 15_create_dw_dim_campaign_etl_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_campaign from
-   Stg_FinanceOps_DB.stg_finance_ops.campaigns.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_campaign
-      - First/full load for a selected period.
-      - Builds a temp working set day by day from @start_time to @end_time.
-      - Truncates dw.dim_campaign.
-      - Resets the identity seed so the next real campaign_key starts from 1.
-      - Re-inserts the unknown row with campaign_key = -1.
-      - Inserts all period campaigns.
-
-   2. etl_admin.usp_load_dw_dim_campaign_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day from @start_time to @end_time.
-      - Ensures the unknown row exists.
-      - Resets identity seed to MAX(campaign_key), so the next inserted row uses
-        MAX(campaign_key) + 1.
-      - Updates changed campaigns by dimension-level row_hash.
-      - Inserts new campaigns.
-
- SCD design:
-   - dw.dim_campaign does not contain effective_from/effective_to/is_current.
-   - Therefore this procedure implements SCD Type 1.
-   - Existing campaign rows are overwritten when campaign attributes change.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-SET NOCOUNT ON;
-GO
-
-
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_campaign
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_campaign
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
@@ -578,620 +245,57 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT = 0,
-          @rows_work_inserted INT = 0,
-          @rows_work_updated INT = 0,
-          @rows_deleted INT = 0,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @sql NVARCHAR(MAX),
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52101, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52102, '@start_time must be earlier than @end_time.', 1;
-    END;
-
-    IF OBJECT_ID(N'dw.dim_campaign', N'U') IS NULL
-    BEGIN
-        THROW 52103, 'Missing target table Charity_DW_DB.dw.dim_campaign.', 1;
-    END;
-
-    IF OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.campaigns', N'U') IS NULL
-    BEGIN
-        THROW 52104, 'Missing source table Stg_FinanceOps_DB.stg_finance_ops.campaigns.', 1;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
-       OR OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
-    BEGIN
-        THROW 52105, 'Missing ETL admin log tables in Charity_DW_DB.etl_admin.', 1;
-    END;
-
+    DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @step_started DATETIME2(0);
+    EXEC etl_admin.usp_dw_start_batch @target_layer=N'DW_DIMENSION', @mart_name=N'FINANCE_MART2', @etl_batch_id=@etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION_FIRST_LOAD', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
+        SET @step_started = SYSDATETIME();
+        TRUNCATE TABLE etl_work.tmp_dim_campaign_load;
+        INSERT INTO etl_work.tmp_dim_campaign_load
+        (existing_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+        VALUES (-1, -1, N'Unknown', N'unknown', NULL, NULL, NULL, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
 
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'campaigns',
-             N'Charity_DW_DB', N'dw', N'dim_campaign',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_campaign. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N'). SCD Type: 1.'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        IF OBJECT_ID('tempdb..#loop_src') IS NOT NULL DROP TABLE #loop_src;
-        IF OBJECT_ID('tempdb..#campaign_work') IS NOT NULL DROP TABLE #campaign_work;
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              campaign_id       INT NOT NULL,
-              source_system     NVARCHAR(100) NOT NULL,
-              title             NVARCHAR(250) NULL,
-              campaign_status   NVARCHAR(50) NULL,
-              target_amount     DECIMAL(18,2) NULL,
-              start_date        DATE NULL,
-              end_date          DATE NULL,
-              row_hash          VARBINARY(32) NULL,
-              created_at        DATETIME2(0) NULL,
-              updated_at        DATETIME2(0) NULL,
-              source_updated_at DATETIME2(0) NULL,
-              stg_row_id        BIGINT NULL,
-              PRIMARY KEY (campaign_id, source_system)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'campaigns',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #campaign_work
-        (
-              campaign_id       INT NOT NULL,
-              source_system     NVARCHAR(100) NOT NULL,
-              title             NVARCHAR(250) NULL,
-              campaign_status   NVARCHAR(50) NULL,
-              target_amount     DECIMAL(18,2) NULL,
-              start_date        DATE NULL,
-              end_date          DATE NULL,
-              row_hash          VARBINARY(32) NULL,
-              created_at        DATETIME2(0) NULL,
-              updated_at        DATETIME2(0) NULL,
-              source_updated_at DATETIME2(0) NULL,
-              stg_row_id        BIGINT NULL,
-              PRIMARY KEY (campaign_id, source_system)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'campaigns',
-             N'tempdb', N'#', N'#campaign_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #campaign_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  campaign_id,
-                  source_system,
-                  title,
-                  campaign_status,
-                  target_amount,
-                  start_date,
-                  end_date,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  s.id AS campaign_id,
-                  ISNULL(s.source_system, N'FINANCE_OPS') AS source_system,
-                  LEFT(s.title, 250) AS title,
-                  s.status AS campaign_status,
-                  s.target_amount,
-                  s.start_date,
-                  s.end_date,
-                  HASHBYTES(
-                      'SHA2_256',
-                      CONCAT(
-                          ISNULL(CONVERT(NVARCHAR(50), s.id), N'<NULL>'), N'|',
-                          ISNULL(ISNULL(s.source_system, N'FINANCE_OPS'), N'<NULL>'), N'|',
-                          ISNULL(LEFT(s.title, 250), N'<NULL>'), N'|',
-                          ISNULL(s.status, N'<NULL>'), N'|',
-                          ISNULL(CONVERT(NVARCHAR(50), s.target_amount), N'<NULL>'), N'|',
-                          ISNULL(CONVERT(NVARCHAR(30), s.start_date, 126), N'<NULL>'), N'|',
-                          ISNULL(CONVERT(NVARCHAR(30), s.end_date, 126), N'<NULL>')
-                      )
-                  ) AS row_hash,
-                  s.created_at,
-                  s.updated_at,
-                  COALESCE(s.source_updated_at, s.updated_at, s.created_at) AS source_updated_at,
-                  s.stg_row_id
-            FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns AS s
-            WHERE s.is_valid = 1
-              AND s.id IS NOT NULL
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) >= @current_from
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) <  @current_to
-              AND s.stg_row_id =
-              (
-                  SELECT MAX(s2.stg_row_id)
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns AS s2
-                  WHERE s2.is_valid = 1
-                    AND s2.id = s.id
-                    AND ISNULL(s2.source_system, N'FINANCE_OPS') = ISNULL(s.source_system, N'FINANCE_OPS')
-                    AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) >= @current_from
-                    AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) <  @current_to
-              );
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total = @rows_read_total + @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'campaigns',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted source campaigns into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.title             = l.title,
-                   w.campaign_status   = l.campaign_status,
-                   w.target_amount     = l.target_amount,
-                   w.start_date        = l.start_date,
-                   w.end_date          = l.end_date,
-                   w.row_hash          = l.row_hash,
-                   w.created_at        = l.created_at,
-                   w.updated_at        = l.updated_at,
-                   w.source_updated_at = l.source_updated_at,
-                   w.stg_row_id        = l.stg_row_id
-            FROM #campaign_work AS w
-            INNER JOIN #loop_src AS l
-                    ON l.campaign_id = w.campaign_id
-                   AND l.source_system = w.source_system
-            WHERE l.source_updated_at >= ISNULL(w.source_updated_at, '19000101');
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total = @rows_work_updated_total + @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#campaign_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Updated existing campaign rows inside #campaign_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #campaign_work
-            (
-                  campaign_id,
-                  source_system,
-                  title,
-                  campaign_status,
-                  target_amount,
-                  start_date,
-                  end_date,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  l.campaign_id,
-                  l.source_system,
-                  l.title,
-                  l.campaign_status,
-                  l.target_amount,
-                  l.start_date,
-                  l.end_date,
-                  l.row_hash,
-                  l.created_at,
-                  l.updated_at,
-                  l.source_updated_at,
-                  l.stg_row_id
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #campaign_work AS w
-                WHERE w.campaign_id = l.campaign_id
-                  AND w.source_system = l.source_system
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total = @rows_work_inserted_total + @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#campaign_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted new campaign rows into #campaign_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
-
-        SET @step_started_at = SYSDATETIME();
+        ;WITH src AS (
+            SELECT id, title, status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at
+            FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns
+            WHERE is_valid = 1 AND id IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_campaign_load
+        (existing_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+        SELECT d.campaign_key, s.id, s.title, s.status, s.target_amount, s.start_date, s.end_date, s.source_system, s.row_hash, s.created_at, s.updated_at
+        FROM src s
+        FULL JOIN dw.dim_campaign d ON d.campaign_id = s.id AND d.campaign_key <> -1
+        WHERE s.id IS NOT NULL;
+        SELECT @rows_read = COUNT(*) FROM etl_work.tmp_dim_campaign_load WHERE campaign_id <> -1;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'campaigns', N'dim_campaign', N'work_ready', @rows_read, 0, 0, 0, @step_started, N'Type 1 dimension work table prepared with FULL JOIN.';
 
         BEGIN TRANSACTION;
-
             TRUNCATE TABLE dw.dim_campaign;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Truncated dw.dim_campaign for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_campaign', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Reset dw.dim_campaign identity seed to 0 for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_campaign ON;
-
             INSERT INTO dw.dim_campaign
-            (
-                  campaign_key,
-                  campaign_id,
-                  title,
-                  campaign_status,
-                  target_amount,
-                  start_date,
-                  end_date,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  -1,
-                  N'Unknown',
-                  N'unknown',
-                  NULL,
-                  NULL,
-                  NULL,
-                  N'FINANCE_OPS',
-                  NULL,
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            (campaign_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+            SELECT existing_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_campaign_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_campaign OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'constant', N'unknown_row', N'dim_campaign',
-                 N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted unknown row into dw.dim_campaign with campaign_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
             INSERT INTO dw.dim_campaign
-            (
-                  campaign_id,
-                  title,
-                  campaign_status,
-                  target_amount,
-                  start_date,
-                  end_date,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.campaign_id,
-                  w.title,
-                  w.campaign_status,
-                  w.target_amount,
-                  w.start_date,
-                  w.end_date,
-                  w.source_system,
-                  w.row_hash,
-                  w.created_at,
-                  w.updated_at
-            FROM #campaign_work AS w;
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#campaign_work',
-                 N'Charity_DW_DB', N'dw', N'dim_campaign',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted first-load campaign rows into dw.dim_campaign.');
-
+            (campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+            SELECT campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_campaign_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
         COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_unknown_inserted + @rows_dim_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(
-                                  N'First load succeeded for dw.dim_campaign. ',
-                                  N'SCD Type 1. ',
-                                  N'Rows read from staging: ', @rows_read_total,
-                                  N'; work inserted: ', @rows_work_inserted_total,
-                                  N'; work updated: ', @rows_work_updated_total,
-                                  N'; unknown inserted: ', @rows_unknown_inserted,
-                                  N'; dim inserted: ', @rows_dim_inserted,
-                                  N'; period: [', CONVERT(NVARCHAR(30), @start_time, 126),
-                                  N', ', CONVERT(NVARCHAR(30), @end_time, 126), N').'
-                               )
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'etl_work.tmp_dim_campaign_load', N'dim_campaign', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 dimension refreshed by truncate + insert.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   rows_read     = @rows_read_total,
-                   rows_inserted  = ISNULL(@rows_unknown_inserted, 0) + ISNULL(@rows_dim_inserted, 0),
-                   rows_rejected = 0,
-                   ended_at      = SYSDATETIME(),
-                   message       = @error_message
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 16_create_dw_dim_category_etl_procedures.sql
- DBMS         : Microsoft SQL Server
 
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_category from
-   Stg_FinanceOps_DB.stg_finance_ops.expense_categories.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_category
-      - First/full load for a selected period.
-      - Builds a temp working set day by day from @start_time to @end_time.
-      - Resolves parent_category_name from the current work set first, then from
-        the latest available staging parent row before @end_time.
-      - Truncates dw.dim_category.
-      - Resets the identity seed so the next real category_key starts from 1.
-      - Re-inserts the unknown row with category_key = -1.
-      - Inserts all period categories.
-
-   2. etl_admin.usp_load_dw_dim_category_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day from @start_time to @end_time.
-      - Resolves parent_category_name from the current work set first, then from
-        existing dw.dim_category, then from latest staging parent row before @end_time.
-      - Ensures the unknown row exists.
-      - Resets identity seed to MAX(category_key), so the next inserted row uses
-        MAX(category_key) + 1.
-      - Updates changed categories by dimension-level row_hash or parent name change.
-      - Inserts new categories.
-      - Refreshes denormalized parent_category_name for existing child categories
-        after parent category changes.
-
- SCD design:
-   - dw.dim_category does not contain effective_from/effective_to/is_current.
-   - Therefore these procedures implement SCD Type 1.
-   - Existing category rows are overwritten when source attributes change.
-   - parent_category_name is a denormalized derived attribute and is refreshed
-     whenever the parent name is available/changed.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_category
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_category
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
@@ -1199,6640 +303,704 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT = 0,
-          @rows_work_inserted INT = 0,
-          @rows_work_updated INT = 0,
-          @rows_deleted INT = 0,
-          @rows_parent_updated INT = 0,
-          @rows_parent_staging_updated INT = 0,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52301, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52302, '@start_time must be earlier than @end_time.', 1;
-    END;
-
-    IF OBJECT_ID(N'dw.dim_category', N'U') IS NULL
-    BEGIN
-        THROW 52303, 'Missing target table Charity_DW_DB.dw.dim_category.', 1;
-    END;
-
-    IF OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.expense_categories', N'U') IS NULL
-    BEGIN
-        THROW 52304, 'Missing source table Stg_FinanceOps_DB.stg_finance_ops.expense_categories.', 1;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
-       OR OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
-    BEGIN
-        THROW 52305, 'Missing ETL admin log tables in Charity_DW_DB.etl_admin.', 1;
-    END;
-
+    DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @step_started DATETIME2(0);
+    EXEC etl_admin.usp_dw_start_batch @target_layer=N'DW_DIMENSION', @mart_name=N'FINANCE_MART2', @etl_batch_id=@etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION_FIRST_LOAD', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
+        SET @step_started = SYSDATETIME();
+        TRUNCATE TABLE etl_work.tmp_dim_category_load;
+        INSERT INTO etl_work.tmp_dim_category_load
+        (existing_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+        VALUES (-1, -1, N'Unknown', NULL, NULL, N'unknown', N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
 
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expense_categories',
-             N'Charity_DW_DB', N'dw', N'dim_category',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_category. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N'). SCD Type: 1.'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        IF OBJECT_ID('tempdb..#loop_src') IS NOT NULL DROP TABLE #loop_src;
-        IF OBJECT_ID('tempdb..#category_work') IS NOT NULL DROP TABLE #category_work;
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              category_id          INT NOT NULL,
-              source_system        NVARCHAR(100) NOT NULL,
-              category_name        NVARCHAR(200) NULL,
-              parent_category_id   INT NULL,
-              parent_category_name NVARCHAR(200) NULL,
-              category_status      NVARCHAR(30) NULL,
-              row_hash             VARBINARY(32) NULL,
-              created_at           DATETIME2(0) NULL,
-              updated_at           DATETIME2(0) NULL,
-              source_updated_at    DATETIME2(0) NULL,
-              stg_row_id           BIGINT NULL,
-              PRIMARY KEY (category_id, source_system)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expense_categories',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #category_work
-        (
-              category_id          INT NOT NULL,
-              source_system        NVARCHAR(100) NOT NULL,
-              category_name        NVARCHAR(200) NULL,
-              parent_category_id   INT NULL,
-              parent_category_name NVARCHAR(200) NULL,
-              category_status      NVARCHAR(30) NULL,
-              row_hash             VARBINARY(32) NULL,
-              created_at           DATETIME2(0) NULL,
-              updated_at           DATETIME2(0) NULL,
-              source_updated_at    DATETIME2(0) NULL,
-              stg_row_id           BIGINT NULL,
-              PRIMARY KEY (category_id, source_system)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expense_categories',
-             N'tempdb', N'#', N'#category_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #category_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  category_id,
-                  source_system,
-                  category_name,
-                  parent_category_id,
-                  parent_category_name,
-                  category_status,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  s.id AS category_id,
-                  ISNULL(s.source_system, N'FINANCE_OPS') AS source_system,
-                  LEFT(s.name, 200) AS category_name,
-                  s.parent_id AS parent_category_id,
-                  NULL AS parent_category_name,
-                  CASE
-                      WHEN s.is_active = 1 THEN N'active'
-                      WHEN s.is_active = 0 THEN N'inactive'
-                      ELSE N'unknown'
-                  END AS category_status,
-                  HASHBYTES(
-                      'SHA2_256',
-                      CONCAT(
-                          ISNULL(CONVERT(NVARCHAR(50), s.id), N'<NULL>'), N'|',
-                          ISNULL(ISNULL(s.source_system, N'FINANCE_OPS'), N'<NULL>'), N'|',
-                          ISNULL(LEFT(s.name, 200), N'<NULL>'), N'|',
-                          ISNULL(CONVERT(NVARCHAR(50), s.parent_id), N'<NULL>'), N'|',
-                          ISNULL(CONVERT(NVARCHAR(10), s.is_active), N'<NULL>')
-                      )
-                  ) AS row_hash,
-                  s.created_at,
-                  s.updated_at,
-                  COALESCE(s.source_updated_at, s.updated_at, s.created_at) AS source_updated_at,
-                  s.stg_row_id
-            FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories AS s
-            WHERE s.is_valid = 1
-              AND s.id IS NOT NULL
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) >= @current_from
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at) <  @current_to
-              AND NOT EXISTS
-              (
-                  SELECT 1
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories AS s2
-                  WHERE s2.is_valid = 1
-                    AND s2.id = s.id
-                    AND ISNULL(s2.source_system, N'FINANCE_OPS') = ISNULL(s.source_system, N'FINANCE_OPS')
-                    AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) >= @current_from
-                    AND COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at) <  @current_to
-                    AND
-                    (
-                           COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at)
-                         > COALESCE(s.source_updated_at, s.updated_at, s.created_at)
-                        OR
-                        (
-                               COALESCE(s2.source_updated_at, s2.updated_at, s2.created_at)
-                             = COALESCE(s.source_updated_at, s.updated_at, s.created_at)
-                           AND s2.stg_row_id > s.stg_row_id
-                        )
-                    )
-              );
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total = @rows_read_total + @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expense_categories',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted source categories into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.category_name        = l.category_name,
-                   w.parent_category_id   = l.parent_category_id,
-                   w.parent_category_name = l.parent_category_name,
-                   w.category_status      = l.category_status,
-                   w.row_hash             = l.row_hash,
-                   w.created_at           = l.created_at,
-                   w.updated_at           = l.updated_at,
-                   w.source_updated_at    = l.source_updated_at,
-                   w.stg_row_id           = l.stg_row_id
-            FROM #category_work AS w
-            INNER JOIN #loop_src AS l
-                    ON l.category_id = w.category_id
-                   AND l.source_system = w.source_system
-            WHERE l.source_updated_at >= ISNULL(w.source_updated_at, '19000101');
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total = @rows_work_updated_total + @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#category_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Updated existing category rows inside #category_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #category_work
-            (
-                  category_id,
-                  source_system,
-                  category_name,
-                  parent_category_id,
-                  parent_category_name,
-                  category_status,
-                  row_hash,
-                  created_at,
-                  updated_at,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  l.category_id,
-                  l.source_system,
-                  l.category_name,
-                  l.parent_category_id,
-                  l.parent_category_name,
-                  l.category_status,
-                  l.row_hash,
-                  l.created_at,
-                  l.updated_at,
-                  l.source_updated_at,
-                  l.stg_row_id
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #category_work AS w
-                WHERE w.category_id = l.category_id
-                  AND w.source_system = l.source_system
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total = @rows_work_inserted_total + @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#category_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted new category rows into #category_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
-
-        SET @step_started_at = SYSDATETIME();
-
-        UPDATE c
-           SET c.parent_category_name = p.category_name
-        FROM #category_work AS c
-        INNER JOIN #category_work AS p
-                ON p.category_id = c.parent_category_id
-               AND p.source_system = c.source_system
-        WHERE c.parent_category_id IS NOT NULL
-          AND
-          (
-                (c.parent_category_name IS NULL AND p.category_name IS NOT NULL)
-             OR (c.parent_category_name IS NOT NULL AND p.category_name IS NULL)
-             OR (c.parent_category_name <> p.category_name)
-          );
-
-        SET @rows_parent_updated = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#category_work',
-             N'tempdb', N'#', N'#category_work',
-             N'succeeded', @rows_parent_updated, 0,
-             @rows_parent_updated, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Resolved parent_category_name in #category_work from categories already present in the same work set.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        UPDATE c
-           SET c.parent_category_name = LEFT(p.name, 200)
-        FROM #category_work AS c
-        INNER JOIN Stg_FinanceOps_DB.stg_finance_ops.expense_categories AS p
-                ON p.id = c.parent_category_id
-               AND ISNULL(p.source_system, N'FINANCE_OPS') = c.source_system
-        WHERE c.parent_category_id IS NOT NULL
-          AND c.parent_category_name IS NULL
-          AND p.is_valid = 1
-          AND COALESCE(p.source_updated_at, p.updated_at, p.created_at) < @end_time
-          AND NOT EXISTS
-          (
-              SELECT 1
-              FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories AS p2
-              WHERE p2.is_valid = 1
-                AND p2.id = p.id
-                AND ISNULL(p2.source_system, N'FINANCE_OPS') = ISNULL(p.source_system, N'FINANCE_OPS')
-                AND COALESCE(p2.source_updated_at, p2.updated_at, p2.created_at) < @end_time
-                AND
-                (
-                       COALESCE(p2.source_updated_at, p2.updated_at, p2.created_at)
-                     > COALESCE(p.source_updated_at, p.updated_at, p.created_at)
-                    OR
-                    (
-                           COALESCE(p2.source_updated_at, p2.updated_at, p2.created_at)
-                         = COALESCE(p.source_updated_at, p.updated_at, p.created_at)
-                       AND p2.stg_row_id > p.stg_row_id
-                    )
-                )
-          );
-
-        SET @rows_parent_staging_updated = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expense_categories',
-             N'tempdb', N'#', N'#category_work',
-             N'succeeded', @rows_parent_staging_updated, 0,
-             @rows_parent_staging_updated, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Resolved remaining parent_category_name values in #category_work from latest available staging parent rows before @end_time.');
-
-        SET @step_started_at = SYSDATETIME();
+        ;WITH src AS (
+            SELECT c.id, c.name, c.parent_id, p.name AS parent_name,
+                   CASE WHEN ISNULL(c.is_active, 0)=1 THEN N'active' ELSE N'inactive' END AS category_status,
+                   c.source_system, c.row_hash, c.created_at, c.updated_at
+            FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories c
+            LEFT JOIN Stg_FinanceOps_DB.stg_finance_ops.expense_categories p ON p.id = c.parent_id AND p.is_valid = 1
+            WHERE c.is_valid = 1 AND c.id IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_category_load
+        (existing_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+        SELECT d.category_key, s.id, s.name, s.parent_id, s.parent_name, s.category_status, s.source_system, s.row_hash, s.created_at, s.updated_at
+        FROM src s
+        FULL JOIN dw.dim_category d ON d.category_id = s.id AND d.category_key <> -1
+        WHERE s.id IS NOT NULL;
+        SELECT @rows_read = COUNT(*) FROM etl_work.tmp_dim_category_load WHERE category_id <> -1;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expense_categories', N'dim_category', N'work_ready', @rows_read, 0, 0, 0, @step_started, N'Type 1 hierarchical dimension work table prepared with FULL JOIN.';
 
         BEGIN TRANSACTION;
-
             TRUNCATE TABLE dw.dim_category;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Truncated dw.dim_category for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_category', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Reset dw.dim_category identity seed to 0 for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_category ON;
-
             INSERT INTO dw.dim_category
-            (
-                  category_key,
-                  category_id,
-                  category_name,
-                  parent_category_id,
-                  parent_category_name,
-                  category_status,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  -1,
-                  N'Unknown',
-                  NULL,
-                  NULL,
-                  N'unknown',
-                  N'FINANCE_OPS',
-                  NULL,
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            (category_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+            SELECT existing_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_category_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_category OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'constant', N'unknown_row', N'dim_category',
-                 N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted unknown row into dw.dim_category with category_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
             INSERT INTO dw.dim_category
-            (
-                  category_id,
-                  category_name,
-                  parent_category_id,
-                  parent_category_name,
-                  category_status,
-                  source_system,
-                  row_hash,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.category_id,
-                  w.category_name,
-                  w.parent_category_id,
-                  w.parent_category_name,
-                  w.category_status,
-                  w.source_system,
-                  w.row_hash,
-                  w.created_at,
-                  w.updated_at
-            FROM #category_work AS w;
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#category_work',
-                 N'Charity_DW_DB', N'dw', N'dim_category',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted first-load category rows into dw.dim_category.');
-
+            (category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+            SELECT category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at
+            FROM etl_work.tmp_dim_category_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
         COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_unknown_inserted + @rows_dim_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(
-                                  N'First load succeeded for dw.dim_category. ',
-                                  N'SCD Type 1. ',
-                                  N'Rows read from staging: ', @rows_read_total,
-                                  N'; work inserted: ', @rows_work_inserted_total,
-                                  N'; work updated: ', @rows_work_updated_total,
-                                  N'; parent names resolved from work set: ', @rows_parent_updated,
-                                  N'; parent names resolved from staging: ', @rows_parent_staging_updated,
-                                  N'; unknown inserted: ', @rows_unknown_inserted,
-                                  N'; dim inserted: ', @rows_dim_inserted,
-                                  N'; period: [', CONVERT(NVARCHAR(30), @start_time, 126),
-                                  N', ', CONVERT(NVARCHAR(30), @end_time, 126), N').'
-                               )
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'etl_work.tmp_dim_category_load', N'dim_category', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 dimension refreshed by truncate + insert.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        BEGIN TRY
-            SET IDENTITY_INSERT dw.dim_category OFF;
-        END TRY
-        BEGIN CATCH
-        END CATCH;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   rows_read     = @rows_read_total,
-                   rows_inserted  = ISNULL(@rows_unknown_inserted, 0) + ISNULL(@rows_dim_inserted, 0),
-                   rows_rejected = 0,
-                   ended_at      = SYSDATETIME(),
-                   message       = @error_message
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 17_create_dw_dim_donation_type_etl_procedures.sql
- DBMS         : Microsoft SQL Server
 
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_donation_type from
-   distinct donation_type values in Stg_FinanceOps_DB.stg_finance_ops.donations.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_donation_type
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.dim_donation_type.
-      - Re-inserts the unknown row with donation_type_key = -1.
-      - Resets the identity seed so the next real key starts from 1.
-      - Inserts all donation types found in the period.
-
-   2. etl_admin.usp_load_dw_dim_donation_type_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Ensures unknown row exists.
-      - Resets identity seed to MAX(donation_type_key), so the next inserted row
-        uses MAX(donation_type_key) + 1.
-      - Updates changed Type 1 attributes.
-      - Inserts new donation types.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-
- SCD Decision:
-   - dw.dim_donation_type has no effective_from, effective_to, is_current,
-     row_hash, or version columns.
-   - Therefore this dimension is loaded as SCD Type 1.
-===============================================================================
-*/
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_donation_type
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_donation_type
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_deleted INT,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52301, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52302, '@start_time must be earlier than @end_time.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'Charity_DW_DB', N'dw', N'dim_donation_type',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_donation_type. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              code              NVARCHAR(50)  NOT NULL PRIMARY KEY,
-              title             NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #donation_type_work
-        (
-              code              NVARCHAR(50)  NOT NULL PRIMARY KEY,
-              title             NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#donation_type_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #donation_type_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.donation_type)))) AS code,
-                  CONVERT(NVARCHAR(100), MIN(LTRIM(RTRIM(s.donation_type)))) AS title,
-                  CONVERT(NVARCHAR(100), MIN(s.source_system)) AS source_system,
-                  MIN(COALESCE(s.created_at, s.extracted_at)) AS created_at,
-                  MAX(COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at)) AS updated_at
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-            WHERE s.is_valid = 1
-              AND s.donation_type IS NOT NULL
-              AND LTRIM(RTRIM(s.donation_type)) <> N''
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-              AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-            GROUP BY LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.donation_type))));
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Loaded distinct donation types into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.title         = l.title,
-                   w.source_system = l.source_system,
-                   w.created_at    = CASE
-                                         WHEN w.created_at IS NULL THEN l.created_at
-                                         WHEN l.created_at IS NULL THEN w.created_at
-                                         WHEN l.created_at < w.created_at THEN l.created_at
-                                         ELSE w.created_at
-                                     END,
-                   w.updated_at    = CASE
-                                         WHEN l.updated_at IS NULL THEN w.updated_at
-                                         WHEN w.updated_at IS NULL THEN l.updated_at
-                                         WHEN l.updated_at >= w.updated_at THEN l.updated_at
-                                         ELSE w.updated_at
-                                     END
-            FROM #donation_type_work AS w
-            INNER JOIN #loop_src AS l
-                ON l.code = w.code
-            WHERE ISNULL(w.title, N'') <> ISNULL(l.title, N'')
-               OR ISNULL(w.source_system, N'') <> ISNULL(l.source_system, N'')
-               OR ISNULL(w.updated_at, CONVERT(DATETIME2(0), '19000101')) < ISNULL(l.updated_at, CONVERT(DATETIME2(0), '19000101'));
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donation_type_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Updated existing rows in #donation_type_work from #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #donation_type_work
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  l.code,
-                  l.title,
-                  l.source_system,
-                  l.created_at,
-                  l.updated_at
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #donation_type_work AS w
-                WHERE w.code = l.code
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donation_type_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted new rows into #donation_type_work from #loop_src.');
-
-            SET @current_from = @current_to;
-        END;
-
+        TRUNCATE TABLE etl_work.tmp_dim_donation_type_load;
+        INSERT INTO etl_work.tmp_dim_donation_type_load(existing_key, code, title, source_system, created_at, updated_at)
+        VALUES(-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+        ;WITH src AS (
+            SELECT DISTINCT LOWER(LTRIM(RTRIM(donation_type))) AS code,
+                   LTRIM(RTRIM(donation_type)) AS title,
+                   N'FINANCE_OPS' AS source_system
+            FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+            WHERE is_valid=1 AND NULLIF(LTRIM(RTRIM(donation_type)), N'') IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_donation_type_load(existing_key, code, title, source_system, created_at, updated_at)
+        SELECT d.donation_type_key, s.code, s.title, s.source_system, SYSDATETIME(), NULL
+        FROM src s
+        FULL JOIN dw.dim_donation_type d ON d.code = s.code AND d.donation_type_key <> -1
+        WHERE s.code IS NOT NULL;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_dim_donation_type_load WHERE code<>N'unknown';
         BEGIN TRANSACTION;
-
-            SET @step_started_at = SYSDATETIME();
-
             TRUNCATE TABLE dw.dim_donation_type;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Truncated dw.dim_donation_type for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_donation_type ON;
-
-            INSERT INTO dw.dim_donation_type
-            (
-                  donation_type_key,
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  N'unknown',
-                  N'Unknown',
-                  N'FINANCE_OPS',
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            INSERT INTO dw.dim_donation_type(donation_type_key, code, title, source_system, created_at, updated_at)
+            SELECT existing_key, code, title, source_system, created_at, updated_at FROM etl_work.tmp_dim_donation_type_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_donation_type OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'system', N'system', N'unknown_row',
-                 N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted unknown row into dw.dim_donation_type with donation_type_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_donation_type', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Reset identity seed for dw.dim_donation_type to 0 after unknown row.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO dw.dim_donation_type
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.code,
-                  w.title,
-                  ISNULL(w.source_system, N'FINANCE_OPS'),
-                  ISNULL(w.created_at, SYSDATETIME()),
-                  w.updated_at
-            FROM #donation_type_work AS w
-            WHERE w.code <> N'unknown';
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#donation_type_work',
-                 N'Charity_DW_DB', N'dw', N'dim_donation_type',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted first-load rows into dw.dim_donation_type.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_unknown_inserted + @rows_dim_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(N'Finished first load for dw.dim_donation_type. ',
-                                      N'Distinct loop rows read: ', @rows_read_total,
-                                      N'. Temp inserted: ', @rows_work_inserted_total,
-                                      N'. Temp updated: ', @rows_work_updated_total,
-                                      N'. Unknown rows inserted: ', @rows_unknown_inserted,
-                                      N'. Dimension rows inserted: ', @rows_dim_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   message       = CONCAT(N'First load failed for dw.dim_donation_type. Error: ', @error_message)
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            INSERT INTO dw.dim_donation_type(code, title, source_system, created_at, updated_at)
+            SELECT code, title, source_system, created_at, updated_at FROM etl_work.tmp_dim_donation_type_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'dim_donation_type', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 reference dimension refreshed.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 18_create_dw_dim_status_etl_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_status from distinct
-   status values in Finance Operations staging tables.
-
- Sources:
-   - Stg_FinanceOps_DB.stg_finance_ops.campaigns.status  -> status_type = campaign
-   - Stg_FinanceOps_DB.stg_finance_ops.donations.status  -> status_type = donation
-   - Stg_FinanceOps_DB.stg_finance_ops.expenses.status   -> status_type = expense
-   - Stg_FinanceOps_DB.stg_finance_ops.payments.status   -> status_type = payment
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_status
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.dim_status.
-      - Re-inserts the unknown row with status_key = -1.
-      - Resets the identity seed so the next real key starts from 1.
-      - Inserts all status values found in the period.
-
-   2. etl_admin.usp_load_dw_dim_status_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Ensures the unknown row exists.
-      - Resets the identity seed to MAX(status_key).
-      - Updates changed Type 1 attributes.
-      - Inserts new status values.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - Natural key is (status_type, code), because the same code can exist in
-     different source business processes.
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-
- SCD Decision:
-   - dw.dim_status has no effective_from, effective_to, is_current, row_hash,
-     or version columns.
-   - Therefore this dimension is loaded as SCD Type 1.
-===============================================================================
-*/
-
-SET NOCOUNT ON;
-GO
-
-USE Charity_DW_DB;
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl_admin')
-BEGIN
-    EXEC(N'CREATE SCHEMA etl_admin');
-END;
-GO
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_status
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_status
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_deleted INT,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52401, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52402, '@start_time must be earlier than @end_time.', 1;
-    END;
-
-    IF OBJECT_ID(N'dw.dim_status', N'U') IS NULL
-    BEGIN
-        THROW 52403, 'Missing target table Charity_DW_DB.dw.dim_status.', 1;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
-       OR OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
-    BEGIN
-        THROW 52404, 'Missing ETL admin tables in Charity_DW_DB.etl_admin.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_status_sources',
-             N'Charity_DW_DB', N'dw', N'dim_status',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_status. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              status_type       NVARCHAR(50)  NOT NULL,
-              code              NVARCHAR(50)  NOT NULL,
-              title             NVARCHAR(100) NULL,
-              category          NVARCHAR(50)  NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL,
-              PRIMARY KEY CLUSTERED (status_type, code)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_status_sources',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #status_work
-        (
-              status_type       NVARCHAR(50)  NOT NULL,
-              code              NVARCHAR(50)  NOT NULL,
-              title             NVARCHAR(100) NULL,
-              category          NVARCHAR(50)  NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL,
-              PRIMARY KEY CLUSTERED (status_type, code)
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_status_sources',
-             N'tempdb', N'#', N'#status_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #status_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  status_type,
-                  code,
-                  title,
-                  category,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  src.status_type,
-                  src.code,
-                  CONVERT(NVARCHAR(100), MIN(src.title)) AS title,
-                  src.category,
-                  CONVERT(NVARCHAR(100), MIN(src.source_system)) AS source_system,
-                  MIN(src.created_at) AS created_at,
-                  MAX(src.updated_at) AS updated_at
-            FROM
-            (
-                SELECT
-                      CONVERT(NVARCHAR(50), N'campaign') AS status_type,
-                      LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) AS code,
-                      CONVERT(NVARCHAR(100), LTRIM(RTRIM(s.status))) AS title,
-                      CONVERT(NVARCHAR(50), N'master') AS category,
-                      s.source_system,
-                      COALESCE(s.created_at, s.extracted_at) AS created_at,
-                      COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns AS s
-                WHERE s.is_valid = 1
-                  AND s.status IS NOT NULL
-                  AND LTRIM(RTRIM(s.status)) <> N''
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                UNION ALL
-
-                SELECT
-                      CONVERT(NVARCHAR(50), N'donation') AS status_type,
-                      LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) AS code,
-                      CONVERT(NVARCHAR(100), LTRIM(RTRIM(s.status))) AS title,
-                      CONVERT(NVARCHAR(50), N'transaction') AS category,
-                      s.source_system,
-                      COALESCE(s.created_at, s.extracted_at) AS created_at,
-                      COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-                WHERE s.is_valid = 1
-                  AND s.status IS NOT NULL
-                  AND LTRIM(RTRIM(s.status)) <> N''
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                UNION ALL
-
-                SELECT
-                      CONVERT(NVARCHAR(50), N'expense') AS status_type,
-                      LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) AS code,
-                      CONVERT(NVARCHAR(100), LTRIM(RTRIM(s.status))) AS title,
-                      CONVERT(NVARCHAR(50), N'transaction') AS category,
-                      s.source_system,
-                      COALESCE(s.created_at, s.extracted_at) AS created_at,
-                      COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                FROM Stg_FinanceOps_DB.stg_finance_ops.expenses AS s
-                WHERE s.is_valid = 1
-                  AND s.status IS NOT NULL
-                  AND LTRIM(RTRIM(s.status)) <> N''
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                UNION ALL
-
-                SELECT
-                      CONVERT(NVARCHAR(50), N'payment') AS status_type,
-                      LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) AS code,
-                      CONVERT(NVARCHAR(100), LTRIM(RTRIM(s.status))) AS title,
-                      CONVERT(NVARCHAR(50), N'transaction') AS category,
-                      s.source_system,
-                      COALESCE(s.created_at, s.extracted_at) AS created_at,
-                      COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                FROM Stg_FinanceOps_DB.stg_finance_ops.payments AS s
-                WHERE s.is_valid = 1
-                  AND s.status IS NOT NULL
-                  AND LTRIM(RTRIM(s.status)) <> N''
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                  AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-            ) AS src
-            GROUP BY src.status_type, src.code, src.category;
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_status_sources',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Loaded distinct status values into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.title         = l.title,
-                   w.category      = l.category,
-                   w.source_system = l.source_system,
-                   w.created_at    = CASE
-                                         WHEN w.created_at IS NULL THEN l.created_at
-                                         WHEN l.created_at IS NULL THEN w.created_at
-                                         WHEN l.created_at < w.created_at THEN l.created_at
-                                         ELSE w.created_at
-                                     END,
-                   w.updated_at    = CASE
-                                         WHEN l.updated_at IS NULL THEN w.updated_at
-                                         WHEN w.updated_at IS NULL THEN l.updated_at
-                                         WHEN l.updated_at >= w.updated_at THEN l.updated_at
-                                         ELSE w.updated_at
-                                     END
-            FROM #status_work AS w
-            INNER JOIN #loop_src AS l
-                ON l.status_type = w.status_type
-               AND l.code = w.code
-            WHERE ISNULL(w.title, N'') <> ISNULL(l.title, N'')
-               OR ISNULL(w.category, N'') <> ISNULL(l.category, N'')
-               OR ISNULL(w.source_system, N'') <> ISNULL(l.source_system, N'')
-               OR ISNULL(w.updated_at, CONVERT(DATETIME2(0), '19000101')) < ISNULL(l.updated_at, CONVERT(DATETIME2(0), '19000101'));
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#status_work',
-                 N'succeeded', @rows_loop_inserted, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Updated existing rows in #status_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #status_work
-            (
-                  status_type,
-                  code,
-                  title,
-                  category,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  l.status_type,
-                  l.code,
-                  l.title,
-                  l.category,
-                  l.source_system,
-                  l.created_at,
-                  l.updated_at
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #status_work AS w
-                WHERE w.status_type = l.status_type
-                  AND w.code = l.code
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#status_work',
-                 N'succeeded', @rows_loop_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted new rows into #status_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
-
+        TRUNCATE TABLE etl_work.tmp_dim_status_load;
+        INSERT INTO etl_work.tmp_dim_status_load(existing_key, status_type, code, title, category, source_system, created_at, updated_at)
+        VALUES(-1, N'unknown', N'unknown', N'Unknown', N'unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+        ;WITH raw_status AS (
+            SELECT N'campaign' AS status_type, status AS code FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns WHERE is_valid=1
+            UNION SELECT N'donation', status FROM Stg_FinanceOps_DB.stg_finance_ops.donations WHERE is_valid=1
+            UNION SELECT N'expense', status FROM Stg_FinanceOps_DB.stg_finance_ops.expenses WHERE is_valid=1
+            UNION SELECT N'payment', status FROM Stg_FinanceOps_DB.stg_finance_ops.payments WHERE is_valid=1
+        ), src AS (
+            SELECT DISTINCT status_type,
+                   LOWER(LTRIM(RTRIM(code))) AS code,
+                   LTRIM(RTRIM(code)) AS title,
+                   status_type AS category,
+                   N'FINANCE_OPS' AS source_system
+            FROM raw_status
+            WHERE NULLIF(LTRIM(RTRIM(code)), N'') IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_status_load(existing_key, status_type, code, title, category, source_system, created_at, updated_at)
+        SELECT d.status_key, s.status_type, s.code, s.title, s.category, s.source_system, SYSDATETIME(), NULL
+        FROM src s
+        FULL JOIN dw.dim_status d ON d.status_type = s.status_type AND d.code = s.code AND d.status_key <> -1
+        WHERE s.code IS NOT NULL;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_dim_status_load WHERE code<>N'unknown';
         BEGIN TRANSACTION;
-
-            SET @step_started_at = SYSDATETIME();
-
             TRUNCATE TABLE dw.dim_status;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Truncated dw.dim_status for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_status ON;
-
-            INSERT INTO dw.dim_status
-            (
-                  status_key,
-                  status_type,
-                  code,
-                  title,
-                  category,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  N'unknown',
-                  N'unknown',
-                  N'Unknown',
-                  N'unknown',
-                  N'FINANCE_OPS',
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            INSERT INTO dw.dim_status(status_key, status_type, code, title, category, source_system, created_at, updated_at)
+            SELECT existing_key, status_type, code, title, category, source_system, created_at, updated_at FROM etl_work.tmp_dim_status_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_status OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'system', N'system', N'unknown_row',
-                 N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted unknown row into dw.dim_status with status_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_status', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Reset identity seed of dw.dim_status to 0 after first-load unknown row.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO dw.dim_status
-            (
-                  status_type,
-                  code,
-                  title,
-                  category,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.status_type,
-                  w.code,
-                  w.title,
-                  w.category,
-                  ISNULL(w.source_system, N'FINANCE_OPS'),
-                  ISNULL(w.created_at, SYSDATETIME()),
-                  w.updated_at
-            FROM #status_work AS w;
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#status_work',
-                 N'Charity_DW_DB', N'dw', N'dim_status',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted first-load status rows into dw.dim_status.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status = N'succeeded',
-               rows_read = @rows_read_total,
-               rows_inserted = @rows_dim_inserted + @rows_unknown_inserted,
-               rows_rejected = 0,
-               ended_at = SYSDATETIME(),
-               message = CONCAT(N'First load finished for dw.dim_status. Work inserted=',
-                                @rows_work_inserted_total, N', work updated=',
-                                @rows_work_updated_total, N', dimension inserted=',
-                                @rows_dim_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status = N'failed',
-                   ended_at = SYSDATETIME(),
-                   message = CONCAT(N'First load failed for dw.dim_status. Error: ', @error_message)
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            INSERT INTO dw.dim_status(status_type, code, title, category, source_system, created_at, updated_at)
+            SELECT status_type, code, title, category, source_system, created_at, updated_at FROM etl_work.tmp_dim_status_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'status_sources', N'dim_status', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 status dimension refreshed.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 19_create_dw_dim_currency_etl_procedures.sql
- DBMS         : Microsoft SQL Server
 
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_currency from all
-   Finance staging sources that can introduce a currency code.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_currency
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.dim_currency.
-      - Re-inserts the unknown row with currency_key = -1.
-      - Resets the identity seed so the next real key starts from 1.
-      - Inserts all currency codes found in the selected period.
-
-   2. etl_admin.usp_load_dw_dim_currency_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Ensures unknown row exists.
-      - Resets identity seed to MAX(currency_key), so the next inserted row
-        uses MAX(currency_key) + 1.
-      - Updates changed Type 1 attributes.
-      - Inserts new currency codes.
-
- Sources:
-   - Stg_FinanceOps_DB.stg_finance_ops.donations.currency
-   - Stg_FinanceOps_DB.stg_finance_ops.expenses.currency
-   - Stg_FinanceOps_DB.stg_finance_ops.payments.currency
-   - Stg_FinanceOps_DB.stg_finance_ops.currency_rates.from_currency
-   - Stg_FinanceOps_DB.stg_finance_ops.currency_rates.to_currency
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-
- SCD Decision:
-   - dw.dim_currency has no effective_from, effective_to, is_current,
-     row_hash, or version columns.
-   - Therefore this dimension is loaded as SCD Type 1.
-===============================================================================
-*/
-
-SET NOCOUNT ON;
-GO
-
-USE Charity_DW_DB;
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl_admin')
-BEGIN
-    EXEC(N'CREATE SCHEMA etl_admin');
-END;
-GO
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_currency
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_currency
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_deleted INT,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52501, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52502, '@start_time must be earlier than @end_time.', 1;
-    END;
-
-    IF OBJECT_ID(N'dw.dim_currency', N'U') IS NULL
-    BEGIN
-        THROW 52503, 'Missing table Charity_DW_DB.dw.dim_currency.', 1;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
-       OR OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
-    BEGIN
-        THROW 52504, 'Missing ETL admin tables in Charity_DW_DB.etl_admin.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_currency_sources',
-             N'Charity_DW_DB', N'dw', N'dim_currency',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_currency. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              code              NVARCHAR(10)  NOT NULL PRIMARY KEY,
-              name              NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_currency_sources',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #currency_work
-        (
-              code              NVARCHAR(10)  NOT NULL PRIMARY KEY,
-              name              NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_currency_sources',
-             N'tempdb', N'#', N'#currency_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #currency_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  code,
-                  name,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  src.code,
-                  CASE src.code
-                       WHEN N'IRR' THEN N'Iranian Rial'
-                       WHEN N'USD' THEN N'US Dollar'
-                       WHEN N'EUR' THEN N'Euro'
-                       WHEN N'GBP' THEN N'British Pound'
-                       WHEN N'AED' THEN N'UAE Dirham'
-                       WHEN N'TRY' THEN N'Turkish Lira'
-                       WHEN N'CAD' THEN N'Canadian Dollar'
-                       WHEN N'AUD' THEN N'Australian Dollar'
-                       WHEN N'CHF' THEN N'Swiss Franc'
-                       WHEN N'CNY' THEN N'Chinese Yuan'
-                       WHEN N'JPY' THEN N'Japanese Yen'
-                       WHEN N'RUB' THEN N'Russian Ruble'
-                       ELSE src.code
-                  END AS name,
-                  MIN(src.source_system) AS source_system,
-                  MIN(src.created_at) AS created_at,
-                  MAX(src.updated_at) AS updated_at
-            FROM
-            (
-                  SELECT
-                        UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.currency)))) AS code,
-                        s.source_system,
-                        COALESCE(s.created_at, s.extracted_at) AS created_at,
-                        COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-                  WHERE s.is_valid = 1
-                    AND s.currency IS NOT NULL
-                    AND LTRIM(RTRIM(s.currency)) <> N''
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                  UNION ALL
-
-                  SELECT
-                        UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.currency)))) AS code,
-                        s.source_system,
-                        COALESCE(s.created_at, s.extracted_at) AS created_at,
-                        COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.expenses AS s
-                  WHERE s.is_valid = 1
-                    AND s.currency IS NOT NULL
-                    AND LTRIM(RTRIM(s.currency)) <> N''
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                  UNION ALL
-
-                  SELECT
-                        UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.currency)))) AS code,
-                        s.source_system,
-                        COALESCE(s.created_at, s.extracted_at) AS created_at,
-                        COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS updated_at
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.payments AS s
-                  WHERE s.is_valid = 1
-                    AND s.currency IS NOT NULL
-                    AND LTRIM(RTRIM(s.currency)) <> N''
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to
-
-                  UNION ALL
-
-                  SELECT
-                        UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.from_currency)))) AS code,
-                        s.source_system,
-                        s.extracted_at AS created_at,
-                        COALESCE(s.source_updated_at, s.extracted_at) AS updated_at
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates AS s
-                  WHERE s.is_valid = 1
-                    AND s.from_currency IS NOT NULL
-                    AND LTRIM(RTRIM(s.from_currency)) <> N''
-                    AND COALESCE(s.source_updated_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.extracted_at) <  @current_to
-
-                  UNION ALL
-
-                  SELECT
-                        UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.to_currency)))) AS code,
-                        s.source_system,
-                        s.extracted_at AS created_at,
-                        COALESCE(s.source_updated_at, s.extracted_at) AS updated_at
-                  FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates AS s
-                  WHERE s.is_valid = 1
-                    AND s.to_currency IS NOT NULL
-                    AND LTRIM(RTRIM(s.to_currency)) <> N''
-                    AND COALESCE(s.source_updated_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.extracted_at) <  @current_to
-            ) AS src
-            WHERE src.code IS NOT NULL
-              AND src.code <> N''
-            GROUP BY src.code;
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'multiple_currency_sources',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted distinct currency rows into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.name = l.name,
-                   w.source_system = ISNULL(w.source_system, l.source_system),
-                   w.created_at = CASE
-                                      WHEN l.created_at IS NOT NULL
-                                           AND (w.created_at IS NULL OR l.created_at < w.created_at)
-                                      THEN l.created_at
-                                      ELSE w.created_at
-                                  END,
-                   w.updated_at = CASE
-                                      WHEN l.updated_at IS NOT NULL
-                                           AND (w.updated_at IS NULL OR l.updated_at > w.updated_at)
-                                      THEN l.updated_at
-                                      ELSE w.updated_at
-                                  END
-            FROM #currency_work AS w
-            INNER JOIN #loop_src AS l
-                ON l.code = w.code;
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#currency_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Updated existing rows in #currency_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #currency_work
-            (
-                  code,
-                  name,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  l.code,
-                  l.name,
-                  ISNULL(l.source_system, N'FINANCE_OPS'),
-                  l.created_at,
-                  l.updated_at
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                  SELECT 1
-                  FROM #currency_work AS w
-                  WHERE w.code = l.code
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#currency_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted new rows into #currency_work for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
-
+        TRUNCATE TABLE etl_work.tmp_dim_currency_load;
+        INSERT INTO etl_work.tmp_dim_currency_load(existing_key, code, name, source_system, created_at, updated_at)
+        VALUES(-1, N'UNK', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+        ;WITH raw_currency AS (
+            SELECT currency AS code FROM Stg_FinanceOps_DB.stg_finance_ops.donations WHERE is_valid=1
+            UNION SELECT currency FROM Stg_FinanceOps_DB.stg_finance_ops.expenses WHERE is_valid=1
+            UNION SELECT currency FROM Stg_FinanceOps_DB.stg_finance_ops.payments WHERE is_valid=1
+            UNION SELECT from_currency FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates WHERE is_valid=1
+            UNION SELECT to_currency FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates WHERE is_valid=1
+        ), src AS (
+            SELECT DISTINCT UPPER(LTRIM(RTRIM(code))) AS code,
+                   UPPER(LTRIM(RTRIM(code))) AS name,
+                   N'FINANCE_OPS' AS source_system
+            FROM raw_currency
+            WHERE NULLIF(LTRIM(RTRIM(code)), N'') IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_currency_load(existing_key, code, name, source_system, created_at, updated_at)
+        SELECT d.currency_key, s.code, s.name, s.source_system, SYSDATETIME(), NULL
+        FROM src s
+        FULL JOIN dw.dim_currency d ON d.code = s.code AND d.currency_key <> -1
+        WHERE s.code IS NOT NULL;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_dim_currency_load WHERE code<>N'UNK';
         BEGIN TRANSACTION;
-            SET @step_started_at = SYSDATETIME();
-
             TRUNCATE TABLE dw.dim_currency;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Truncated dw.dim_currency for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_currency ON;
-
-            INSERT INTO dw.dim_currency
-                (currency_key, code, name, source_system, created_at, updated_at)
-            VALUES
-                (-1, N'UNK', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            INSERT INTO dw.dim_currency(currency_key, code, name, source_system, created_at, updated_at)
+            SELECT existing_key, code, name, source_system, created_at, updated_at FROM etl_work.tmp_dim_currency_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_currency OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#currency_work',
-                 N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted unknown row into dw.dim_currency with currency_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_currency', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Reset dw.dim_currency identity seed to 0 after inserting unknown row.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO dw.dim_currency
-            (
-                  code,
-                  name,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.code,
-                  w.name,
-                  ISNULL(w.source_system, N'FINANCE_OPS'),
-                  ISNULL(w.created_at, SYSDATETIME()),
-                  w.updated_at
-            FROM #currency_work AS w
-            WHERE w.code <> N'UNK';
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#currency_work',
-                 N'Charity_DW_DB', N'dw', N'dim_currency',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted first-load rows into dw.dim_currency.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_unknown_inserted + @rows_dim_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(N'Finished first load for dw.dim_currency. ',
-                                      N'Distinct loop rows read: ', @rows_read_total,
-                                      N'. Temp inserted: ', @rows_work_inserted_total,
-                                      N'. Temp updated: ', @rows_work_updated_total,
-                                      N'. Unknown rows inserted: ', @rows_unknown_inserted,
-                                      N'. Dimension rows inserted: ', @rows_dim_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   message       = CONCAT(N'First load failed for dw.dim_currency. Error: ', @error_message)
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            INSERT INTO dw.dim_currency(code, name, source_system, created_at, updated_at)
+            SELECT code, name, source_system, created_at, updated_at FROM etl_work.tmp_dim_currency_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'currency_sources', N'dim_currency', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 currency dimension refreshed.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 20_create_dw_dim_allocation_type_etl_procedures.sql
- DBMS         : Microsoft SQL Server
 
- Purpose:
-   Create two practical ETL procedures for loading dw.dim_allocation_type from
-   distinct source_type values in Stg_FinanceOps_DB.stg_finance_ops.budget_allocations.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_dim_allocation_type
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.dim_allocation_type.
-      - Re-inserts the unknown row with allocation_type_key = -1.
-      - Resets the identity seed so the next real key starts from 1.
-      - Inserts all allocation types found in the period.
-
-   2. etl_admin.usp_load_dw_dim_allocation_type_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Ensures unknown row exists.
-      - Resets identity seed to MAX(allocation_type_key), so the next inserted row
-        uses MAX(allocation_type_key) + 1.
-      - Updates changed Type 1 attributes.
-      - Inserts new allocation types.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-
- SCD Decision:
-   - dw.dim_allocation_type has no effective_from, effective_to, is_current,
-     row_hash, or version columns.
-   - Therefore this dimension is loaded as SCD Type 1.
-===============================================================================
-*/
-
-USE Charity_DW_DB;
-GO
-
-GO
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.dim_allocation_type
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_allocation_type
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_loop_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_deleted INT,
-          @rows_unknown_inserted INT = 0,
-          @rows_dim_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52301, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52302, '@start_time must be earlier than @end_time.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_DIMENSION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.dim_allocation_type. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #loop_src
-        (
-              code              NVARCHAR(50)  NOT NULL PRIMARY KEY,
-              title             NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #allocation_type_work
-        (
-              code              NVARCHAR(50)  NOT NULL PRIMARY KEY,
-              title             NVARCHAR(100) NULL,
-              source_system     NVARCHAR(100) NULL,
-              created_at        DATETIME2(0)  NULL,
-              updated_at        DATETIME2(0)  NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#allocation_type_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #allocation_type_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.source_type)))) AS code,
-                  CONVERT(NVARCHAR(100), MIN(LTRIM(RTRIM(s.source_type)))) AS title,
-                  CONVERT(NVARCHAR(100), MIN(s.source_system)) AS source_system,
-                  MIN(COALESCE(s.created_at, s.extracted_at)) AS created_at,
-                  MAX(COALESCE(s.source_updated_at, s.created_at, s.extracted_at)) AS updated_at
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations AS s
-            WHERE s.is_valid = 1
-              AND s.source_type IS NOT NULL
-              AND LTRIM(RTRIM(s.source_type)) <> N''
-              AND COALESCE(s.source_updated_at, s.created_at, s.extracted_at) >= @current_from
-              AND COALESCE(s.source_updated_at, s.created_at, s.extracted_at) <  @current_to
-            GROUP BY LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.source_type))));
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Loaded distinct allocation types into #loop_src for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE w
-               SET w.title         = l.title,
-                   w.source_system = l.source_system,
-                   w.created_at    = CASE
-                                         WHEN w.created_at IS NULL THEN l.created_at
-                                         WHEN l.created_at IS NULL THEN w.created_at
-                                         WHEN l.created_at < w.created_at THEN l.created_at
-                                         ELSE w.created_at
-                                     END,
-                   w.updated_at    = CASE
-                                         WHEN l.updated_at IS NULL THEN w.updated_at
-                                         WHEN w.updated_at IS NULL THEN l.updated_at
-                                         WHEN l.updated_at >= w.updated_at THEN l.updated_at
-                                         ELSE w.updated_at
-                                     END
-            FROM #allocation_type_work AS w
-            INNER JOIN #loop_src AS l
-                ON l.code = w.code
-            WHERE ISNULL(w.title, N'') <> ISNULL(l.title, N'')
-               OR ISNULL(w.source_system, N'') <> ISNULL(l.source_system, N'')
-               OR ISNULL(w.updated_at, CONVERT(DATETIME2(0), '19000101')) < ISNULL(l.updated_at, CONVERT(DATETIME2(0), '19000101'));
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#allocation_type_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Updated existing rows in #allocation_type_work from #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #allocation_type_work
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  l.code,
-                  l.title,
-                  l.source_system,
-                  l.created_at,
-                  l.updated_at
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #allocation_type_work AS w
-                WHERE w.code = l.code
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#allocation_type_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted new rows into #allocation_type_work from #loop_src.');
-
-            SET @current_from = @current_to;
-        END;
-
+        TRUNCATE TABLE etl_work.tmp_dim_allocation_type_load;
+        INSERT INTO etl_work.tmp_dim_allocation_type_load(existing_key, code, title, source_system, created_at, updated_at)
+        VALUES(-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+        ;WITH src AS (
+            SELECT DISTINCT LOWER(LTRIM(RTRIM(source_type))) AS code,
+                   LTRIM(RTRIM(source_type)) AS title,
+                   N'FINANCE_OPS' AS source_system
+            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations
+            WHERE is_valid=1 AND NULLIF(LTRIM(RTRIM(source_type)), N'') IS NOT NULL
+        )
+        INSERT INTO etl_work.tmp_dim_allocation_type_load(existing_key, code, title, source_system, created_at, updated_at)
+        SELECT d.allocation_type_key, s.code, s.title, s.source_system, SYSDATETIME(), NULL
+        FROM src s
+        FULL JOIN dw.dim_allocation_type d ON d.code = s.code AND d.allocation_type_key <> -1
+        WHERE s.code IS NOT NULL;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_dim_allocation_type_load WHERE code<>N'unknown';
         BEGIN TRANSACTION;
-
-            SET @step_started_at = SYSDATETIME();
-
             TRUNCATE TABLE dw.dim_allocation_type;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Truncated dw.dim_allocation_type for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
             SET IDENTITY_INSERT dw.dim_allocation_type ON;
-
-            INSERT INTO dw.dim_allocation_type
-            (
-                  allocation_type_key,
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            VALUES
-            (
-                  -1,
-                  N'unknown',
-                  N'Unknown',
-                  N'FINANCE_OPS',
-                  SYSDATETIME(),
-                  NULL
-            );
-
-            SET @rows_unknown_inserted = @@ROWCOUNT;
-
+            INSERT INTO dw.dim_allocation_type(allocation_type_key, code, title, source_system, created_at, updated_at)
+            SELECT existing_key, code, title, source_system, created_at, updated_at FROM etl_work.tmp_dim_allocation_type_load WHERE existing_key IS NOT NULL;
+            SET @rows_inserted += @@ROWCOUNT;
             SET IDENTITY_INSERT dw.dim_allocation_type OFF;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'system', N'system', N'unknown_row',
-                 N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'succeeded', 1, @rows_unknown_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted unknown row into dw.dim_allocation_type with allocation_type_key = -1.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            DBCC CHECKIDENT ('dw.dim_allocation_type', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Reset identity seed for dw.dim_allocation_type to 0 after unknown row.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO dw.dim_allocation_type
-            (
-                  code,
-                  title,
-                  source_system,
-                  created_at,
-                  updated_at
-            )
-            SELECT
-                  w.code,
-                  w.title,
-                  ISNULL(w.source_system, N'FINANCE_OPS'),
-                  ISNULL(w.created_at, SYSDATETIME()),
-                  w.updated_at
-            FROM #allocation_type_work AS w
-            WHERE w.code <> N'unknown';
-
-            SET @rows_dim_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#allocation_type_work',
-                 N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-                 N'succeeded', @rows_dim_inserted, @rows_dim_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted first-load rows into dw.dim_allocation_type.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_unknown_inserted + @rows_dim_inserted,
-               rows_rejected = 0,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(N'Finished first load for dw.dim_allocation_type. ',
-                                      N'Distinct loop rows read: ', @rows_read_total,
-                                      N'. Temp inserted: ', @rows_work_inserted_total,
-                                      N'. Temp updated: ', @rows_work_updated_total,
-                                      N'. Unknown rows inserted: ', @rows_unknown_inserted,
-                                      N'. Dimension rows inserted: ', @rows_dim_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   message       = CONCAT(N'First load failed for dw.dim_allocation_type. Error: ', @error_message)
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            INSERT INTO dw.dim_allocation_type(code, title, source_system, created_at, updated_at)
+            SELECT code, title, source_system, created_at, updated_at FROM etl_work.tmp_dim_allocation_type_load WHERE existing_key IS NULL;
+            SET @rows_inserted += @@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'dim_allocation_type', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Type 1 allocation type dimension refreshed.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 21_create_dw_fact_donation_transaction_etl_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two practical ETL procedures for loading dw.fact_donation_transaction
-   from Stg_FinanceOps_DB.stg_finance_ops.donations.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_fact_donation_transaction
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.fact_donation_transaction.
-      - Resets the identity seed so the first real fact key starts from 1.
-      - Inserts one row per donation transaction.
-
-   2. etl_admin.usp_load_dw_fact_donation_transaction_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Resets identity seed to the current MAX(donation_transaction_key).
-      - Deletes affected source donation rows from the fact table.
-      - Inserts the latest affected rows again.
-
- Fact Type Decision:
-   - dw.fact_donation_transaction is a TRANSACTION FACT.
-   - It has a business event date through donation_date/date_key.
-   - It is not an accumulating snapshot, so measures are not recalculated from
-     the beginning to the present. Incremental ETL reloads only affected
-     donation transaction rows.
-
- Grain:
-   - One row per source donation transaction.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - The ETL window detects affected rows by donation_date OR source change time
-     so late status/reference changes can update older donation events.
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Dimension lookup failures use unknown keys = -1.
-   - center_key is set to -1 because source donations has no center_id.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.fact_donation_transaction
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_donation_transaction
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_deleted INT,
-          @rows_loop_ids INT,
-          @rows_rejected INT,
-          @rows_loop_inserted INT,
-          @rows_updated INT,
-          @rows_inserted INT,
-          @rows_work_inserted INT,
-          @rows_work_updated INT,
-          @rows_fact_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_rejected_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @date_lookup_sql NVARCHAR(MAX),
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52401, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52402, '@start_time must be earlier than @end_time.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_FACT', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.fact_donation_transaction. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        /*---------------------------------------------------------------------
-          Small dimension lookup temp tables.
-          These avoid repeated scans of heap dimensions inside the daily loop.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_date
-        (
-              date_value DATE NOT NULL PRIMARY KEY,
-              date_key   INT  NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_date', N'FullDateAlternateKey') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'TimeKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDateAlternateKey AS DATE), MIN(TimeKey)
-                FROM dw.dim_date
-                WHERE FullDateAlternateKey IS NOT NULL
-                  AND ISNULL(TimeKey, -1) <> -1
-                GROUP BY CAST(FullDateAlternateKey AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'full_date') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'date_key') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(full_date AS DATE), MIN(date_key)
-                FROM dw.dim_date
-                WHERE full_date IS NOT NULL
-                  AND ISNULL(date_key, -1) <> -1
-                GROUP BY CAST(full_date AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'FullDate') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_date', N'DateKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDate AS DATE), MIN(DateKey)
-                FROM dw.dim_date
-                WHERE FullDate IS NOT NULL
-                  AND ISNULL(DateKey, -1) <> -1
-                GROUP BY CAST(FullDate AS DATE);';
-        END
-        ELSE
-        BEGIN
-            THROW 52403, 'Cannot resolve dw.dim_date columns. Expected (TimeKey, FullDateAlternateKey), (date_key, full_date), or (DateKey, FullDate).', 1;
-        END;
-
-        EXEC sys.sp_executesql @date_lookup_sql;
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_date',
-             N'tempdb', N'#', N'#dim_date',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_date lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_donor
-        (
-              donor_id  BIGINT NOT NULL PRIMARY KEY,
-              donor_key INT    NOT NULL
-        );
-
-        INSERT INTO #dim_donor (donor_id, donor_key)
-        SELECT CONVERT(BIGINT, donor_id), MIN(donor_key)
-        FROM dw.dim_donor
-        WHERE donor_id IS NOT NULL
-          AND ISNULL(donor_key, -1) <> -1
-        GROUP BY CONVERT(BIGINT, donor_id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'tempdb', N'#', N'#dim_donor',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_donor lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_campaign
-        (
-              campaign_id  BIGINT NOT NULL PRIMARY KEY,
-              campaign_key INT    NOT NULL
-        );
-
-        INSERT INTO #dim_campaign (campaign_id, campaign_key)
-        SELECT CONVERT(BIGINT, campaign_id), MIN(campaign_key)
-        FROM dw.dim_campaign
-        WHERE campaign_id IS NOT NULL
-          AND ISNULL(campaign_key, -1) <> -1
-        GROUP BY CONVERT(BIGINT, campaign_id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_campaign',
-             N'tempdb', N'#', N'#dim_campaign',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_campaign lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_donation_type
-        (
-              code              NVARCHAR(50) NOT NULL PRIMARY KEY,
-              donation_type_key INT          NOT NULL
-        );
-
-        INSERT INTO #dim_donation_type (code, donation_type_key)
-        SELECT LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code)))), MIN(donation_type_key)
-        FROM dw.dim_donation_type
-        WHERE code IS NOT NULL
-          AND LTRIM(RTRIM(code)) <> N''
-          AND ISNULL(donation_type_key, -1) <> -1
-        GROUP BY LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code))));
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donation_type',
-             N'tempdb', N'#', N'#dim_donation_type',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_donation_type lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_currency
-        (
-              code         NVARCHAR(10) NOT NULL PRIMARY KEY,
-              currency_key INT          NOT NULL
-        );
-
-        INSERT INTO #dim_currency (code, currency_key)
-        SELECT UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(code)))), MIN(currency_key)
-        FROM dw.dim_currency
-        WHERE code IS NOT NULL
-          AND LTRIM(RTRIM(code)) <> N''
-          AND ISNULL(currency_key, -1) <> -1
-        GROUP BY UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(code))));
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_currency',
-             N'tempdb', N'#', N'#dim_currency',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_currency lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_status
-        (
-              status_type NVARCHAR(50) NOT NULL,
-              code        NVARCHAR(50) NOT NULL,
-              status_key  INT          NOT NULL,
-              PRIMARY KEY (status_type, code)
-        );
-
-        INSERT INTO #dim_status (status_type, code, status_key)
+        TRUNCATE TABLE etl_work.tmp_fact_donation_transaction_load;
+        INSERT INTO etl_work.tmp_fact_donation_transaction_load
+        (date_key, donor_key, campaign_key, center_key, donation_type_key, currency_key, status_key, amount, is_confirmed, is_refunded,
+         source_donation_id, source_donor_id, source_campaign_id, source_reference_code, source_system, etl_batch_id, loaded_at)
         SELECT
-              LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(status_type)))),
-              LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code)))),
-              MIN(status_key)
-        FROM dw.dim_status
-        WHERE status_type IS NOT NULL
-          AND code IS NOT NULL
-          AND LTRIM(RTRIM(status_type)) <> N''
-          AND LTRIM(RTRIM(code)) <> N''
-          AND ISNULL(status_key, -1) <> -1
-        GROUP BY
-              LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(status_type)))),
-              LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code))));
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_status',
-             N'tempdb', N'#', N'#dim_status',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_status lookup table.');
-
-        /*---------------------------------------------------------------------
-          Working temp tables.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #loop_ids
-        (
-              source_donation_id BIGINT NOT NULL PRIMARY KEY,
-              stg_row_id         BIGINT NOT NULL,
-              source_updated_at  DATETIME2(0) NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#loop_ids',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_ids.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #loop_src
-        (
-              source_donation_id    BIGINT NOT NULL PRIMARY KEY,
-              donation_date         DATE NULL,
-              source_donor_id       BIGINT NULL,
-              source_campaign_id    BIGINT NULL,
-              donation_type_code    NVARCHAR(50) NULL,
-              currency_code         NVARCHAR(10) NULL,
-              status_code           NVARCHAR(50) NULL,
-              amount                DECIMAL(18,2) NULL,
-              source_reference_code NVARCHAR(100) NULL,
-              source_system         NVARCHAR(100) NULL,
-              source_updated_at     DATETIME2(0) NULL,
-              stg_row_id            BIGINT NULL,
-
-              date_key              INT NOT NULL DEFAULT (-1),
-              donor_key             INT NOT NULL DEFAULT (-1),
-              campaign_key          INT NOT NULL DEFAULT (-1),
-              center_key            INT NOT NULL DEFAULT (-1),
-              donation_type_key     INT NOT NULL DEFAULT (-1),
-              currency_key          INT NOT NULL DEFAULT (-1),
-              status_key            INT NOT NULL DEFAULT (-1),
-              is_confirmed          BIT NULL,
-              is_refunded           BIT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #donation_work
-        (
-              source_donation_id    BIGINT NOT NULL PRIMARY KEY,
-              date_key              INT NOT NULL,
-              donor_key             INT NOT NULL,
-              campaign_key          INT NOT NULL,
-              center_key            INT NOT NULL,
-              donation_type_key     INT NOT NULL,
-              currency_key          INT NOT NULL,
-              status_key            INT NOT NULL,
-              amount                DECIMAL(18,2) NULL,
-              is_confirmed          BIT NULL,
-              is_refunded           BIT NULL,
-              source_donor_id       BIGINT NULL,
-              source_campaign_id    BIGINT NULL,
-              source_reference_code NVARCHAR(100) NULL,
-              source_system         NVARCHAR(100) NULL,
-              source_updated_at     DATETIME2(0) NULL,
-              stg_row_id            BIGINT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#donation_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #donation_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-            DELETE FROM #loop_ids;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_ids',
-                 N'tempdb', N'#', N'#loop_ids',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_ids for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            SELECT @rows_rejected = COUNT(1)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-            WHERE
-            (
-                   (s.donation_date IS NOT NULL
-                    AND CONVERT(DATETIME2(0), s.donation_date) >= @current_from
-                    AND CONVERT(DATETIME2(0), s.donation_date) <  @current_to)
-                OR (COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to)
-            )
-            AND (ISNULL(s.is_valid, 0) <> 1 OR s.id IS NULL);
-
-            INSERT INTO #loop_ids
-            (
-                  source_donation_id,
-                  stg_row_id,
-                  source_updated_at
-            )
-            SELECT
-                  CONVERT(BIGINT, s.id) AS source_donation_id,
-                  MAX(s.stg_row_id) AS stg_row_id,
-                  MAX(COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at)) AS source_updated_at
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-            WHERE s.is_valid = 1
-              AND s.id IS NOT NULL
-              AND
-              (
-                     (s.donation_date IS NOT NULL
-                      AND CONVERT(DATETIME2(0), s.donation_date) >= @current_from
-                      AND CONVERT(DATETIME2(0), s.donation_date) <  @current_to)
-                  OR (COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @current_from
-                      AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @current_to)
-              )
-            GROUP BY CONVERT(BIGINT, s.id);
-
-            SET @rows_loop_ids = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_ids;
-            SET @rows_rejected_total += ISNULL(@rows_rejected, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-                 N'tempdb', N'#', N'#loop_ids',
-                 N'succeeded', @rows_loop_ids, @rows_loop_ids,
-                 0, @rows_rejected,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Loaded latest affected donation IDs into #loop_ids for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Cleared #loop_src before loading current period donation rows.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  source_donation_id,
-                  donation_date,
-                  source_donor_id,
-                  source_campaign_id,
-                  donation_type_code,
-                  currency_code,
-                  status_code,
-                  amount,
-                  source_reference_code,
-                  source_system,
-                  source_updated_at,
-                  stg_row_id,
-                  center_key,
-                  is_confirmed,
-                  is_refunded
-            )
-            SELECT
-                  CONVERT(BIGINT, s.id) AS source_donation_id,
-                  s.donation_date,
-                  CONVERT(BIGINT, s.donor_id) AS source_donor_id,
-                  CONVERT(BIGINT, s.campaign_id) AS source_campaign_id,
-                  LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.donation_type)))) AS donation_type_code,
-                  UPPER(CONVERT(NVARCHAR(10), LTRIM(RTRIM(s.currency)))) AS currency_code,
-                  LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) AS status_code,
-                  s.amount,
-                  s.reference_code,
-                  ISNULL(s.source_system, N'FINANCE_OPS') AS source_system,
-                  COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) AS source_updated_at,
-                  s.stg_row_id,
-                  -1 AS center_key,
-                  CASE
-                      WHEN LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) IN
-                           (N'confirmed', N'complete', N'completed', N'paid', N'success', N'succeeded', N'approved')
-                      THEN 1 ELSE 0
-                  END AS is_confirmed,
-                  CASE
-                      WHEN LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.status)))) IN
-                           (N'refund', N'refunded', N'chargeback')
-                      THEN 1 ELSE 0
-                  END AS is_refunded
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS s
-            INNER JOIN #loop_ids AS i
-                ON i.stg_row_id = s.stg_row_id;
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted current period donation rows into #loop_src with normalized business codes.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.date_key = ISNULL(d.date_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_date AS d
-                ON d.date_value = l.donation_date;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_date',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated date_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.donor_key = ISNULL(d.donor_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_donor AS d
-                ON d.donor_id = l.source_donor_id;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_donor',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated donor_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.campaign_key = ISNULL(c.campaign_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_campaign AS c
-                ON c.campaign_id = l.source_campaign_id;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_campaign',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated campaign_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.donation_type_key = ISNULL(t.donation_type_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_donation_type AS t
-                ON t.code = l.donation_type_code;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_donation_type',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated donation_type_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.currency_key = ISNULL(c.currency_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_currency AS c
-                ON c.code = l.currency_code;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_currency',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated currency_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE l
-               SET l.status_key = ISNULL(s.status_key, -1)
-            FROM #loop_src AS l
-            LEFT JOIN #dim_status AS s
-                ON s.status_type = N'donation'
-               AND s.code = l.status_code;
-            SET @rows_updated = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#dim_status',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_updated, 0,
-                 @rows_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated status_key in #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            UPDATE w
-               SET w.date_key              = l.date_key,
-                   w.donor_key             = l.donor_key,
-                   w.campaign_key          = l.campaign_key,
-                   w.center_key            = l.center_key,
-                   w.donation_type_key     = l.donation_type_key,
-                   w.currency_key          = l.currency_key,
-                   w.status_key            = l.status_key,
-                   w.amount                = l.amount,
-                   w.is_confirmed          = l.is_confirmed,
-                   w.is_refunded           = l.is_refunded,
-                   w.source_donor_id       = l.source_donor_id,
-                   w.source_campaign_id    = l.source_campaign_id,
-                   w.source_reference_code = l.source_reference_code,
-                   w.source_system         = l.source_system,
-                   w.source_updated_at     = l.source_updated_at,
-                   w.stg_row_id            = l.stg_row_id
-            FROM #donation_work AS w
-            INNER JOIN #loop_src AS l
-                ON l.source_donation_id = w.source_donation_id
-            WHERE ISNULL(l.source_updated_at, CONVERT(DATETIME2(0), '19000101')) >= ISNULL(w.source_updated_at, CONVERT(DATETIME2(0), '19000101'))
-              AND ISNULL(l.stg_row_id, 0) >= ISNULL(w.stg_row_id, 0);
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donation_work',
-                 N'succeeded', @rows_work_updated, 0,
-                 @rows_work_updated, 0,
-                 @step_started_at, SYSDATETIME(), N'Updated existing donation rows in #donation_work from #loop_src.');
-
-            SET @step_started_at = SYSDATETIME();
-            INSERT INTO #donation_work
-            (
-                  source_donation_id,
-                  date_key,
-                  donor_key,
-                  campaign_key,
-                  center_key,
-                  donation_type_key,
-                  currency_key,
-                  status_key,
-                  amount,
-                  is_confirmed,
-                  is_refunded,
-                  source_donor_id,
-                  source_campaign_id,
-                  source_reference_code,
-                  source_system,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  l.source_donation_id,
-                  l.date_key,
-                  l.donor_key,
-                  l.campaign_key,
-                  l.center_key,
-                  l.donation_type_key,
-                  l.currency_key,
-                  l.status_key,
-                  l.amount,
-                  l.is_confirmed,
-                  l.is_refunded,
-                  l.source_donor_id,
-                  l.source_campaign_id,
-                  l.source_reference_code,
-                  l.source_system,
-                  l.source_updated_at,
-                  l.stg_row_id
-            FROM #loop_src AS l
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #donation_work AS w
-                WHERE w.source_donation_id = l.source_donation_id
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#donation_work',
-                 N'succeeded', @rows_work_inserted, @rows_work_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted new donation rows into #donation_work from #loop_src.');
-
-            SET @current_from = @current_to;
-        END;
-
+            ISNULL(dd.TimeKey, -1),
+            ISNULL(donor.donor_key, -1),
+            ISNULL(camp.campaign_key, -1),
+            -1,
+            ISNULL(dt.donation_type_key, -1),
+            ISNULL(cur.currency_key, -1),
+            ISNULL(st.status_key, -1),
+            d.amount,
+            CASE WHEN LOWER(ISNULL(d.status,N'')) = N'confirmed' THEN 1 ELSE 0 END,
+            CASE WHEN LOWER(ISNULL(d.status,N'')) = N'refunded' THEN 1 ELSE 0 END,
+            d.id, d.donor_id, d.campaign_id, d.reference_code, d.source_system, @etl_batch_id, SYSDATETIME()
+        FROM Stg_FinanceOps_DB.stg_finance_ops.donations d
+        INNER JOIN (
+            SELECT id, MAX(stg_row_id) AS max_stg_row_id
+            FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+            WHERE is_valid = 1 AND id IS NOT NULL
+            GROUP BY id
+        ) d_latest ON d_latest.max_stg_row_id = d.stg_row_id
+        LEFT JOIN dw.dim_date dd ON dd.FullDateAlternateKey = d.donation_date
+        LEFT JOIN (SELECT donor_id, MIN(donor_key) AS donor_key FROM dw.dim_donor GROUP BY donor_id) donor ON donor.donor_id = d.donor_id
+        LEFT JOIN (SELECT campaign_id, MIN(campaign_key) AS campaign_key FROM dw.dim_campaign GROUP BY campaign_id) camp ON camp.campaign_id = d.campaign_id
+        LEFT JOIN (SELECT code, MIN(donation_type_key) AS donation_type_key FROM dw.dim_donation_type GROUP BY code) dt ON dt.code = LOWER(LTRIM(RTRIM(d.donation_type)))
+        LEFT JOIN (SELECT code, MIN(currency_key) AS currency_key FROM dw.dim_currency GROUP BY code) cur ON cur.code = UPPER(LTRIM(RTRIM(d.currency)))
+        LEFT JOIN (SELECT status_type, code, MIN(status_key) AS status_key FROM dw.dim_status GROUP BY status_type, code) st ON st.status_type = N'donation' AND st.code = LOWER(LTRIM(RTRIM(d.status)))
+        WHERE d.is_valid = 1 AND d.id IS NOT NULL AND CONVERT(DATETIME2(0), d.donation_date) >= @start_time AND CONVERT(DATETIME2(0), d.donation_date) < @end_time;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_donation_transaction_load;
         BEGIN TRANSACTION;
-
-            SET @step_started_at = SYSDATETIME();
             TRUNCATE TABLE dw.fact_donation_transaction;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-                 N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Truncated dw.fact_donation_transaction for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-            DBCC CHECKIDENT ('dw.fact_donation_transaction', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-                 N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Reset identity seed for dw.fact_donation_transaction to 0.');
-
-            SET @step_started_at = SYSDATETIME();
+            DBCC CHECKIDENT ('dw.fact_donation_transaction', RESEED, -1);
             INSERT INTO dw.fact_donation_transaction
-            (
-                  date_key,
-                  donor_key,
-                  campaign_key,
-                  center_key,
-                  donation_type_key,
-                  currency_key,
-                  status_key,
-                  amount,
-                  is_confirmed,
-                  is_refunded,
-                  source_donation_id,
-                  source_donor_id,
-                  source_campaign_id,
-                  source_reference_code,
-                  source_system,
-                  etl_batch_id,
-                  loaded_at
-            )
-            SELECT
-                  w.date_key,
-                  w.donor_key,
-                  w.campaign_key,
-                  w.center_key,
-                  w.donation_type_key,
-                  w.currency_key,
-                  w.status_key,
-                  w.amount,
-                  w.is_confirmed,
-                  w.is_refunded,
-                  w.source_donation_id,
-                  w.source_donor_id,
-                  w.source_campaign_id,
-                  w.source_reference_code,
-                  ISNULL(w.source_system, N'FINANCE_OPS'),
-                  @etl_batch_id,
-                  SYSDATETIME()
-            FROM #donation_work AS w;
-
-            SET @rows_fact_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#donation_work',
-                 N'Charity_DW_DB', N'dw', N'fact_donation_transaction',
-                 N'succeeded', @rows_fact_inserted, @rows_fact_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Inserted first-load rows into dw.fact_donation_transaction.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-           SET load_status   = N'succeeded',
-               rows_read     = @rows_read_total,
-               rows_inserted  = @rows_fact_inserted,
-               rows_rejected = @rows_rejected_total,
-               ended_at      = SYSDATETIME(),
-               message       = CONCAT(N'First load completed for dw.fact_donation_transaction. Work inserts=',
-                                      @rows_work_inserted_total, N', work updates=',
-                                      @rows_work_updated_total, N', fact inserts=',
-                                      @rows_fact_inserted, N'.')
-         WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-               SET load_status   = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   message       = CONCAT(N'First load failed for dw.fact_donation_transaction. Error: ', @error_message)
-             WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            (date_key, donor_key, campaign_key, center_key, donation_type_key, currency_key, status_key, amount, is_confirmed, is_refunded,
+             source_donation_id, source_donor_id, source_campaign_id, source_reference_code, source_system, etl_batch_id, loaded_at)
+            SELECT t.date_key, t.donor_key, t.campaign_key, t.center_key, t.donation_type_key, t.currency_key, t.status_key, t.amount, t.is_confirmed, t.is_refunded,
+                   t.source_donation_id, t.source_donor_id, t.source_campaign_id, t.source_reference_code, t.source_system, t.etl_batch_id, t.loaded_at
+            FROM etl_work.tmp_fact_donation_transaction_load t
+            WHERE NOT EXISTS (SELECT 1 FROM dw.fact_donation_transaction f WHERE f.source_donation_id = t.source_donation_id);
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'fact_donation_transaction', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Transaction fact append-only load. No updates.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 22_create_dw_fact_budget_allocation_event_etl_procedures.sql
- DBMS         : Microsoft SQL Server
+CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_expense_transaction
+      @start_time DATETIME2(0),
+      @end_time   DATETIME2(0)
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+    BEGIN TRY
+        TRUNCATE TABLE etl_work.tmp_fact_expense_transaction_load;
+        INSERT INTO etl_work.tmp_fact_expense_transaction_load
+        (date_key, center_key, child_key, category_key, currency_key, status_key, amount, is_approved, is_rejected, description,
+         source_expense_id, source_center_id, source_child_id, source_category_id, source_system, etl_batch_id, loaded_at)
+        SELECT ISNULL(dd.TimeKey,-1), ISNULL(c.center_key,-1), ISNULL(ch.child_key,-1), ISNULL(cat.category_key,-1), ISNULL(cur.currency_key,-1), ISNULL(st.status_key,-1),
+               e.amount,
+               CASE WHEN LOWER(ISNULL(e.status,N'')) = N'approved' THEN 1 ELSE 0 END,
+               CASE WHEN LOWER(ISNULL(e.status,N'')) = N'rejected' THEN 1 ELSE 0 END,
+               e.description, e.id, e.center_id, e.child_id, e.category_id, e.source_system, @etl_batch_id, SYSDATETIME()
+        FROM Stg_FinanceOps_DB.stg_finance_ops.expenses e
+        INNER JOIN (
+            SELECT id, MAX(stg_row_id) AS max_stg_row_id
+            FROM Stg_FinanceOps_DB.stg_finance_ops.expenses
+            WHERE is_valid = 1 AND id IS NOT NULL
+            GROUP BY id
+        ) e_latest ON e_latest.max_stg_row_id = e.stg_row_id
+        LEFT JOIN dw.dim_date dd ON dd.FullDateAlternateKey = e.expense_date
+        LEFT JOIN (SELECT center_id, MIN(center_key) AS center_key FROM dw.dim_center GROUP BY center_id) c ON c.center_id = e.center_id
+        LEFT JOIN (SELECT child_id, MIN(child_key) AS child_key FROM dw.dim_child GROUP BY child_id) ch ON ch.child_id = e.child_id
+        LEFT JOIN (SELECT category_id, MIN(category_key) AS category_key FROM dw.dim_category GROUP BY category_id) cat ON cat.category_id = e.category_id
+        LEFT JOIN (SELECT code, MIN(currency_key) AS currency_key FROM dw.dim_currency GROUP BY code) cur ON cur.code = UPPER(LTRIM(RTRIM(e.currency)))
+        LEFT JOIN (SELECT status_type, code, MIN(status_key) AS status_key FROM dw.dim_status GROUP BY status_type, code) st ON st.status_type=N'expense' AND st.code = LOWER(LTRIM(RTRIM(e.status)))
+        WHERE e.is_valid=1 AND e.id IS NOT NULL AND CONVERT(DATETIME2(0), e.expense_date) >= @start_time AND CONVERT(DATETIME2(0), e.expense_date) < @end_time;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_expense_transaction_load;
+        BEGIN TRANSACTION;
+            TRUNCATE TABLE dw.fact_expense_transaction;
+            DBCC CHECKIDENT ('dw.fact_expense_transaction', RESEED, -1);
+            INSERT INTO dw.fact_expense_transaction
+            (date_key, center_key, child_key, category_key, currency_key, status_key, amount, is_approved, is_rejected, description,
+             source_expense_id, source_center_id, source_child_id, source_category_id, source_system, etl_batch_id, loaded_at)
+            SELECT t.date_key, t.center_key, t.child_key, t.category_key, t.currency_key, t.status_key, t.amount, t.is_approved, t.is_rejected, t.description,
+                   t.source_expense_id, t.source_center_id, t.source_child_id, t.source_category_id, t.source_system, t.etl_batch_id, t.loaded_at
+            FROM etl_work.tmp_fact_expense_transaction_load t
+            WHERE NOT EXISTS (SELECT 1 FROM dw.fact_expense_transaction f WHERE f.source_expense_id=t.source_expense_id);
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expenses', N'fact_expense_transaction', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Transaction fact append-only load. No updates.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
+GO
 
- Purpose:
-   Create two practical ETL procedures for loading dw.fact_budget_allocation_event
-   from Stg_FinanceOps_DB.stg_finance_ops.budget_allocations.
 
- Procedures:
-   1. etl_admin.usp_first_load_dw_fact_budget_allocation_event
-      - First/full load for a selected period.
-      - Builds a temp working set day by day.
-      - Truncates dw.fact_budget_allocation_event.
-      - Resets the identity seed so the first real fact key starts from 1.
-      - Inserts one row per source budget allocation event.
+CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_payment_transaction
+      @start_time DATETIME2(0),
+      @end_time   DATETIME2(0)
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+    BEGIN TRY
+        TRUNCATE TABLE etl_work.tmp_fact_payment_transaction_load;
+        INSERT INTO etl_work.tmp_fact_payment_transaction_load
+        (date_key, center_key, currency_key, status_key, payment_type, source_teacher_id, amount, is_paid, is_cancelled,
+         source_payment_id, source_center_id, source_system, etl_batch_id, loaded_at)
+        SELECT ISNULL(dd.TimeKey,-1), ISNULL(c.center_key,-1), ISNULL(cur.currency_key,-1), ISNULL(st.status_key,-1),
+               p.payment_type, p.teacher_id, p.amount,
+               CASE WHEN LOWER(ISNULL(p.status,N'')) = N'paid' THEN 1 ELSE 0 END,
+               CASE WHEN LOWER(ISNULL(p.status,N'')) IN (N'cancelled', N'canceled') THEN 1 ELSE 0 END,
+               p.id, p.center_id, p.source_system, @etl_batch_id, SYSDATETIME()
+        FROM Stg_FinanceOps_DB.stg_finance_ops.payments p
+        INNER JOIN (
+            SELECT id, MAX(stg_row_id) AS max_stg_row_id
+            FROM Stg_FinanceOps_DB.stg_finance_ops.payments
+            WHERE is_valid = 1 AND id IS NOT NULL
+            GROUP BY id
+        ) p_latest ON p_latest.max_stg_row_id = p.stg_row_id
+        LEFT JOIN dw.dim_date dd ON dd.FullDateAlternateKey = p.payment_date
+        LEFT JOIN (SELECT center_id, MIN(center_key) AS center_key FROM dw.dim_center GROUP BY center_id) c ON c.center_id = p.center_id
+        LEFT JOIN (SELECT code, MIN(currency_key) AS currency_key FROM dw.dim_currency GROUP BY code) cur ON cur.code = UPPER(LTRIM(RTRIM(p.currency)))
+        LEFT JOIN (SELECT status_type, code, MIN(status_key) AS status_key FROM dw.dim_status GROUP BY status_type, code) st ON st.status_type=N'payment' AND st.code = LOWER(LTRIM(RTRIM(p.status)))
+        WHERE p.is_valid=1 AND p.id IS NOT NULL AND CONVERT(DATETIME2(0), p.payment_date) >= @start_time AND CONVERT(DATETIME2(0), p.payment_date) < @end_time;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_payment_transaction_load;
+        BEGIN TRANSACTION;
+            TRUNCATE TABLE dw.fact_payment_transaction;
+            DBCC CHECKIDENT ('dw.fact_payment_transaction', RESEED, -1);
+            INSERT INTO dw.fact_payment_transaction
+            (date_key, center_key, currency_key, status_key, payment_type, source_teacher_id, amount, is_paid, is_cancelled,
+             source_payment_id, source_center_id, source_system, etl_batch_id, loaded_at)
+            SELECT t.date_key, t.center_key, t.currency_key, t.status_key, t.payment_type, t.source_teacher_id, t.amount, t.is_paid, t.is_cancelled,
+                   t.source_payment_id, t.source_center_id, t.source_system, t.etl_batch_id, t.loaded_at
+            FROM etl_work.tmp_fact_payment_transaction_load t
+            WHERE NOT EXISTS (SELECT 1 FROM dw.fact_payment_transaction f WHERE f.source_payment_id=t.source_payment_id);
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'payments', N'fact_payment_transaction', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Transaction fact append-only load. No updates.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
+GO
 
-   2. etl_admin.usp_load_dw_fact_budget_allocation_event_incremental
-      - Incremental/normal load for a selected period.
-      - Builds a temp working set day by day.
-      - Resets identity seed to the current MAX(allocation_event_key).
-      - Deletes affected source allocation rows from the fact table.
-      - Inserts the latest affected rows again.
 
- Fact Type Decision:
-   - dw.fact_budget_allocation_event is a TRANSACTION / EVENT FACT.
-   - It has an event date through allocation_date/date_key.
-   - It is not an accumulating snapshot, so measures are not recalculated from
-     the beginning to the present. Incremental ETL reloads only affected
-     allocation event rows.
-
- Grain:
-   - One row per source budget allocation event.
-
- Business Mapping:
-   - date_key               -> allocation_date through dw.dim_date.
-   - center_key             -> budget_allocations.center_id through dw.dim_center.
-   - child_key              -> budget_allocations.child_id through dw.dim_child.
-   - category_key           -> budget_allocations.category_id through dw.dim_category.
-   - allocation_type_key    -> budget_allocations.source_type through dw.dim_allocation_type.
-   - donor_key/campaign_key -> only derived when source_type = 'donation'
-                               by looking up source_id in staging donations.
-                               For internal_budget or unresolved donation,
-                               unknown key -1 is used.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - The ETL window detects affected rows by allocation_date OR source change time.
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Dimension lookup failures use unknown keys = -1.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.fact_budget_allocation_event
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_budget_allocation_event
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_deleted INT = 0,
-          @rows_loop_ids INT = 0,
-          @rows_rejected INT = 0,
-          @rows_inserted INT = 0,
-          @rows_updated INT = 0,
-          @rows_work_inserted INT = 0,
-          @rows_work_updated INT = 0,
-          @rows_fact_inserted INT = 0,
-          @rows_read_total INT = 0,
-          @rows_rejected_total INT = 0,
-          @rows_work_inserted_total INT = 0,
-          @rows_work_updated_total INT = 0,
-          @date_lookup_sql NVARCHAR(MAX),
-          @center_lookup_sql NVARCHAR(MAX),
-          @child_lookup_sql NVARCHAR(MAX),
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52501, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52502, '@start_time must be earlier than @end_time.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_FACT', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.fact_budget_allocation_event. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        /*---------------------------------------------------------------------
-          Dimension lookup temp tables.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_date
-        (
-              date_value DATE NOT NULL PRIMARY KEY,
-              date_key   INT  NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_date', N'FullDateAlternateKey') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'TimeKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDateAlternateKey AS DATE), MIN(TimeKey)
-                FROM dw.dim_date
-                WHERE FullDateAlternateKey IS NOT NULL
-                  AND ISNULL(TimeKey, -1) <> -1
-                GROUP BY CAST(FullDateAlternateKey AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'full_date') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'date_key') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(full_date AS DATE), MIN(date_key)
-                FROM dw.dim_date
-                WHERE full_date IS NOT NULL
-                  AND ISNULL(date_key, -1) <> -1
-                GROUP BY CAST(full_date AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'FullDate') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_date', N'DateKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDate AS DATE), MIN(DateKey)
-                FROM dw.dim_date
-                WHERE FullDate IS NOT NULL
-                  AND ISNULL(DateKey, -1) <> -1
-                GROUP BY CAST(FullDate AS DATE);';
-        END
-        ELSE
-        BEGIN
-            THROW 52503, 'Cannot resolve dw.dim_date columns. Expected (TimeKey, FullDateAlternateKey), (date_key, full_date), or (DateKey, FullDate).', 1;
-        END;
-
-        EXEC sys.sp_executesql @date_lookup_sql;
-        SELECT @rows_inserted = COUNT(1) FROM #dim_date;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_date',
-             N'tempdb', N'#', N'#dim_date',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_date lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_center
-        (
-              source_center_id BIGINT NOT NULL PRIMARY KEY,
-              center_key       INT    NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_center', N'center_id') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_center', N'center_key') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, center_id), MIN(center_key)
-                FROM dw.dim_center
-                WHERE center_id IS NOT NULL
-                  AND ISNULL(center_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, center_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_center', N'source_center_id') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_center', N'center_key') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, source_center_id), MIN(center_key)
-                FROM dw.dim_center
-                WHERE source_center_id IS NOT NULL
-                  AND ISNULL(center_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, source_center_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_center', N'CenterID') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_center', N'CenterKey') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, CenterID), MIN(CenterKey)
-                FROM dw.dim_center
-                WHERE CenterID IS NOT NULL
-                  AND ISNULL(CenterKey, -1) <> -1
-                GROUP BY CONVERT(BIGINT, CenterID);';
-        END
-        ELSE
-        BEGIN
-            THROW 52504, 'Cannot resolve dw.dim_center columns. Expected center_key with center_id/source_center_id, or CenterKey with CenterID.', 1;
-        END;
-
-        EXEC sys.sp_executesql @center_lookup_sql;
-        SELECT @rows_inserted = COUNT(1) FROM #dim_center;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_center',
-             N'tempdb', N'#', N'#dim_center',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_center lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_child
-        (
-              source_child_id BIGINT NOT NULL PRIMARY KEY,
-              child_key       INT    NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_child', N'child_id') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_child', N'child_key') IS NOT NULL
-        BEGIN
-            SET @child_lookup_sql = N'
-                INSERT INTO #dim_child (source_child_id, child_key)
-                SELECT CONVERT(BIGINT, child_id), MIN(child_key)
-                FROM dw.dim_child
-                WHERE child_id IS NOT NULL
-                  AND ISNULL(child_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, child_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_child', N'source_child_id') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_child', N'child_key') IS NOT NULL
-        BEGIN
-            SET @child_lookup_sql = N'
-                INSERT INTO #dim_child (source_child_id, child_key)
-                SELECT CONVERT(BIGINT, source_child_id), MIN(child_key)
-                FROM dw.dim_child
-                WHERE source_child_id IS NOT NULL
-                  AND ISNULL(child_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, source_child_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_child', N'ChildID') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_child', N'ChildKey') IS NOT NULL
-        BEGIN
-            SET @child_lookup_sql = N'
-                INSERT INTO #dim_child (source_child_id, child_key)
-                SELECT CONVERT(BIGINT, ChildID), MIN(ChildKey)
-                FROM dw.dim_child
-                WHERE ChildID IS NOT NULL
-                  AND ISNULL(ChildKey, -1) <> -1
-                GROUP BY CONVERT(BIGINT, ChildID);';
-        END
-        ELSE
-        BEGIN
-            THROW 52505, 'Cannot resolve dw.dim_child columns. Expected child_key with child_id/source_child_id, or ChildKey with ChildID.', 1;
-        END;
-
-        EXEC sys.sp_executesql @child_lookup_sql;
-        SELECT @rows_inserted = COUNT(1) FROM #dim_child;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_child',
-             N'tempdb', N'#', N'#dim_child',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_child lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_category
-        (
-              source_category_id BIGINT NOT NULL PRIMARY KEY,
-              category_key       INT    NOT NULL
-        );
-
-        INSERT INTO #dim_category (source_category_id, category_key)
-        SELECT CONVERT(BIGINT, category_id), MIN(category_key)
-        FROM dw.dim_category
-        WHERE category_id IS NOT NULL
-          AND ISNULL(category_key, -1) <> -1
-        GROUP BY CONVERT(BIGINT, category_id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_category',
-             N'tempdb', N'#', N'#dim_category',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_category lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_allocation_type
-        (
-              code                NVARCHAR(50) NOT NULL PRIMARY KEY,
-              allocation_type_key INT          NOT NULL
-        );
-
-        INSERT INTO #dim_allocation_type (code, allocation_type_key)
-        SELECT LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code)))), MIN(allocation_type_key)
-        FROM dw.dim_allocation_type
-        WHERE code IS NOT NULL
-          AND LTRIM(RTRIM(code)) <> N''
-          AND ISNULL(allocation_type_key, -1) <> -1
-        GROUP BY LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(code))));
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_allocation_type',
-             N'tempdb', N'#', N'#dim_allocation_type',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_allocation_type lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_donor
-        (
-              donor_id  BIGINT NOT NULL PRIMARY KEY,
-              donor_key INT    NOT NULL
-        );
-
-        INSERT INTO #dim_donor (donor_id, donor_key)
-        SELECT CONVERT(BIGINT, donor_id), MIN(donor_key)
-        FROM dw.dim_donor
-        WHERE donor_id IS NOT NULL
-          AND ISNULL(donor_key, -1) <> -1
-        GROUP BY CONVERT(BIGINT, donor_id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'tempdb', N'#', N'#dim_donor',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_donor lookup table.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #dim_campaign
-        (
-              campaign_id  BIGINT NOT NULL PRIMARY KEY,
-              campaign_key INT    NOT NULL
-        );
-
-        INSERT INTO #dim_campaign (campaign_id, campaign_key)
-        SELECT CONVERT(BIGINT, campaign_id), MIN(campaign_key)
-        FROM dw.dim_campaign
-        WHERE campaign_id IS NOT NULL
-          AND ISNULL(campaign_key, -1) <> -1
-        GROUP BY CONVERT(BIGINT, campaign_id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_campaign',
-             N'tempdb', N'#', N'#dim_campaign',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_campaign lookup table.');
-
-        /*---------------------------------------------------------------------
-          Working temp tables.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #loop_ids
-        (
-              source_allocation_id BIGINT NOT NULL PRIMARY KEY,
-              stg_row_id           BIGINT NOT NULL,
-              source_updated_at    DATETIME2(0) NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#loop_ids',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_ids.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #loop_src
-        (
-              source_allocation_id BIGINT NOT NULL PRIMARY KEY,
-              allocation_date      DATE NULL,
-              source_type_code     NVARCHAR(50) NULL,
-              source_id            BIGINT NULL,
-              source_center_id     BIGINT NULL,
-              source_child_id      BIGINT NULL,
-              source_category_id   BIGINT NULL,
-              allocated_amount     DECIMAL(18,2) NULL,
-              reason               NVARCHAR(MAX) NULL,
-              source_system        NVARCHAR(100) NULL,
-              source_updated_at    DATETIME2(0) NULL,
-              stg_row_id           BIGINT NULL,
-
-              date_key             INT NOT NULL DEFAULT (-1),
-              donor_key            INT NOT NULL DEFAULT (-1),
-              center_key           INT NOT NULL DEFAULT (-1),
-              child_key            INT NOT NULL DEFAULT (-1),
-              category_key         INT NOT NULL DEFAULT (-1),
-              campaign_key         INT NOT NULL DEFAULT (-1),
-              allocation_type_key  INT NOT NULL DEFAULT (-1),
-              source_donor_id      BIGINT NULL,
-              source_campaign_id   BIGINT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#loop_src',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #loop_src.');
-
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #allocation_work
-        (
-              source_allocation_id BIGINT NOT NULL PRIMARY KEY,
-              date_key             INT NOT NULL,
-              donor_key            INT NOT NULL,
-              center_key           INT NOT NULL,
-              child_key            INT NOT NULL,
-              category_key         INT NOT NULL,
-              campaign_key         INT NOT NULL,
-              allocation_type_key  INT NOT NULL,
-              allocated_amount     DECIMAL(18,2) NULL,
-              reason               NVARCHAR(MAX) NULL,
-              source_type          NVARCHAR(50) NULL,
-              source_id            BIGINT NULL,
-              source_center_id     BIGINT NULL,
-              source_child_id      BIGINT NULL,
-              source_category_id   BIGINT NULL,
-              source_donor_id      BIGINT NULL,
-              source_campaign_id   BIGINT NULL,
-              source_system        NVARCHAR(100) NULL,
-              source_updated_at    DATETIME2(0) NULL,
-              stg_row_id           BIGINT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#allocation_work',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table #allocation_work.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time
-                SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-            DELETE FROM #loop_ids;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_ids',
-                 N'tempdb', N'#', N'#loop_ids',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Cleared #loop_ids for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            SELECT @rows_rejected = COUNT(1)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations AS s
-            WHERE
-            (
-                   (s.allocation_date IS NOT NULL
-                    AND CONVERT(DATETIME2(0), s.allocation_date) >= @current_from
-                    AND CONVERT(DATETIME2(0), s.allocation_date) <  @current_to)
-                OR (COALESCE(s.source_updated_at, s.created_at, s.extracted_at) >= @current_from
-                    AND COALESCE(s.source_updated_at, s.created_at, s.extracted_at) <  @current_to)
-            )
-            AND (ISNULL(s.is_valid, 0) <> 1 OR s.id IS NULL);
-
-            INSERT INTO #loop_ids
-            (
-                  source_allocation_id,
-                  stg_row_id,
-                  source_updated_at
-            )
-            SELECT
-                  CONVERT(BIGINT, s.id) AS source_allocation_id,
-                  MAX(s.stg_row_id) AS stg_row_id,
-                  MAX(COALESCE(s.source_updated_at, s.created_at, s.extracted_at)) AS source_updated_at
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations AS s
-            WHERE s.is_valid = 1
-              AND s.id IS NOT NULL
-              AND
-              (
-                     (s.allocation_date IS NOT NULL
-                      AND CONVERT(DATETIME2(0), s.allocation_date) >= @current_from
-                      AND CONVERT(DATETIME2(0), s.allocation_date) <  @current_to)
-                  OR (COALESCE(s.source_updated_at, s.created_at, s.extracted_at) >= @current_from
-                      AND COALESCE(s.source_updated_at, s.created_at, s.extracted_at) <  @current_to)
-              )
-            GROUP BY CONVERT(BIGINT, s.id);
-
-            SET @rows_loop_ids = @@ROWCOUNT;
-            SET @rows_read_total += @rows_loop_ids;
-            SET @rows_rejected_total += ISNULL(@rows_rejected, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-                 N'tempdb', N'#', N'#loop_ids',
-                 N'succeeded', @rows_loop_ids, @rows_loop_ids,
-                 0, @rows_rejected,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Loaded latest affected allocation IDs into #loop_ids for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-            DELETE FROM #loop_src;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_deleted, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Cleared #loop_src before loading current period allocation rows.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #loop_src
-            (
-                  source_allocation_id,
-                  allocation_date,
-                  source_type_code,
-                  source_id,
-                  source_center_id,
-                  source_child_id,
-                  source_category_id,
-                  allocated_amount,
-                  reason,
-                  source_system,
-                  source_updated_at,
-                  stg_row_id,
-                  date_key,
-                  center_key,
-                  child_key,
-                  category_key,
-                  allocation_type_key
-            )
-            SELECT
-                  CONVERT(BIGINT, s.id),
-                  s.allocation_date,
-                  LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.source_type)))),
-                  CONVERT(BIGINT, s.source_id),
-                  CONVERT(BIGINT, s.center_id),
-                  CONVERT(BIGINT, s.child_id),
-                  CONVERT(BIGINT, s.category_id),
-                  s.allocated_amount,
-                  CONVERT(NVARCHAR(MAX), s.reason),
-                  s.source_system,
-                  COALESCE(s.source_updated_at, s.created_at, s.extracted_at),
-                  s.stg_row_id,
-                  ISNULL(dd.date_key, -1),
-                  ISNULL(dc.center_key, -1),
-                  ISNULL(dch.child_key, -1),
-                  ISNULL(dcat.category_key, -1),
-                  ISNULL(dat.allocation_type_key, -1)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations AS s
-            INNER JOIN #loop_ids AS ids
-                    ON ids.stg_row_id = s.stg_row_id
-            LEFT JOIN #dim_date AS dd
-                   ON dd.date_value = s.allocation_date
-            LEFT JOIN #dim_center AS dc
-                   ON dc.source_center_id = CONVERT(BIGINT, s.center_id)
-            LEFT JOIN #dim_child AS dch
-                   ON dch.source_child_id = CONVERT(BIGINT, s.child_id)
-            LEFT JOIN #dim_category AS dcat
-                   ON dcat.source_category_id = CONVERT(BIGINT, s.category_id)
-            LEFT JOIN #dim_allocation_type AS dat
-                   ON dat.code = LOWER(CONVERT(NVARCHAR(50), LTRIM(RTRIM(s.source_type))));
-
-            SET @rows_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-                 N'tempdb', N'#', N'#loop_src',
-                 N'succeeded', @rows_inserted, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 N'Loaded current period allocation rows into #loop_src with basic dimension keys.');
-
-            SET @step_started_at = SYSDATETIME();
-
-            UPDATE tgt
-            SET
-                  tgt.date_key            = src.date_key,
-                  tgt.donor_key           = src.donor_key,
-                  tgt.center_key          = src.center_key,
-                  tgt.child_key           = src.child_key,
-                  tgt.category_key        = src.category_key,
-                  tgt.campaign_key        = src.campaign_key,
-                  tgt.allocation_type_key = src.allocation_type_key,
-                  tgt.allocated_amount    = src.allocated_amount,
-                  tgt.reason              = src.reason,
-                  tgt.source_type         = src.source_type_code,
-                  tgt.source_id           = src.source_id,
-                  tgt.source_center_id    = src.source_center_id,
-                  tgt.source_child_id     = src.source_child_id,
-                  tgt.source_category_id  = src.source_category_id,
-                  tgt.source_donor_id     = src.source_donor_id,
-                  tgt.source_campaign_id  = src.source_campaign_id,
-                  tgt.source_system       = src.source_system,
-                  tgt.source_updated_at   = src.source_updated_at,
-                  tgt.stg_row_id          = src.stg_row_id
-            FROM #allocation_work AS tgt
-            INNER JOIN #loop_src AS src
-                    ON src.source_allocation_id = tgt.source_allocation_id;
-
-            SET @rows_work_updated = @@ROWCOUNT;
-            SET @rows_work_updated_total += @rows_work_updated;
-
-            INSERT INTO #allocation_work
-            (
-                  source_allocation_id,
-                  date_key,
-                  donor_key,
-                  center_key,
-                  child_key,
-                  category_key,
-                  campaign_key,
-                  allocation_type_key,
-                  allocated_amount,
-                  reason,
-                  source_type,
-                  source_id,
-                  source_center_id,
-                  source_child_id,
-                  source_category_id,
-                  source_donor_id,
-                  source_campaign_id,
-                  source_system,
-                  source_updated_at,
-                  stg_row_id
-            )
-            SELECT
-                  src.source_allocation_id,
-                  src.date_key,
-                  src.donor_key,
-                  src.center_key,
-                  src.child_key,
-                  src.category_key,
-                  src.campaign_key,
-                  src.allocation_type_key,
-                  src.allocated_amount,
-                  src.reason,
-                  src.source_type_code,
-                  src.source_id,
-                  src.source_center_id,
-                  src.source_child_id,
-                  src.source_category_id,
-                  src.source_donor_id,
-                  src.source_campaign_id,
-                  src.source_system,
-                  src.source_updated_at,
-                  src.stg_row_id
-            FROM #loop_src AS src
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #allocation_work AS tgt
-                WHERE tgt.source_allocation_id = src.source_allocation_id
-            );
-
-            SET @rows_work_inserted = @@ROWCOUNT;
-            SET @rows_work_inserted_total += @rows_work_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#loop_src',
-                 N'tempdb', N'#', N'#allocation_work',
-                 N'succeeded', @rows_inserted, @rows_work_inserted + @rows_work_updated,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Upserted #allocation_work. Inserted: ', @rows_work_inserted,
-                        N'; updated: ', @rows_work_updated, N'.'));
-
-            SET @current_from = @current_to;
-        END;
-
-        /*---------------------------------------------------------------------
-          Resolve donation donor/campaign for allocation events whose source is
-          a donation. This step is done after the loop to avoid repeatedly
-          scanning staging donations inside each day.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-        CREATE TABLE #donation_latest_ids
-        (
-              source_donation_id BIGINT NOT NULL PRIMARY KEY,
-              stg_row_id         BIGINT NOT NULL
-        );
-
-        INSERT INTO #donation_latest_ids (source_donation_id, stg_row_id)
-        SELECT
-              CONVERT(BIGINT, d.id),
-              MAX(d.stg_row_id)
-        FROM Stg_FinanceOps_DB.stg_finance_ops.donations AS d
-        INNER JOIN #allocation_work AS aw
-                ON aw.source_type = N'donation'
-               AND aw.source_id = CONVERT(BIGINT, d.id)
-        WHERE d.is_valid = 1
-          AND d.id IS NOT NULL
-        GROUP BY CONVERT(BIGINT, d.id);
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#donation_latest_ids',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Loaded latest referenced donation IDs for donation-based allocations.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        UPDATE aw
-        SET
-              aw.source_donor_id = CONVERT(BIGINT, d.donor_id),
-              aw.source_campaign_id = CONVERT(BIGINT, d.campaign_id),
-              aw.donor_key = ISNULL(ddonor.donor_key, -1),
-              aw.campaign_key = ISNULL(dcamp.campaign_key, -1)
-        FROM #allocation_work AS aw
-        INNER JOIN #donation_latest_ids AS ids
-                ON ids.source_donation_id = aw.source_id
-        INNER JOIN Stg_FinanceOps_DB.stg_finance_ops.donations AS d
-                ON d.stg_row_id = ids.stg_row_id
-        LEFT JOIN #dim_donor AS ddonor
-               ON ddonor.donor_id = CONVERT(BIGINT, d.donor_id)
-        LEFT JOIN #dim_campaign AS dcamp
-               ON dcamp.campaign_id = CONVERT(BIGINT, d.campaign_id)
-        WHERE aw.source_type = N'donation';
-
-        SET @rows_updated = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#allocation_work',
-             N'tempdb', N'#', N'#allocation_work',
-             N'succeeded', @rows_updated, 0,
-             @rows_updated, 0,
-             @step_started_at, SYSDATETIME(), N'Resolved donor_key and campaign_key for donation-based allocations.');
-
-        /*---------------------------------------------------------------------
-          First load DW write.
-        ---------------------------------------------------------------------*/
+        TRUNCATE TABLE etl_work.tmp_fact_budget_allocation_event_load;
+        INSERT INTO etl_work.tmp_fact_budget_allocation_event_load
+        (date_key, donor_key, center_key, child_key, category_key, campaign_key, allocation_type_key, allocated_amount, reason,
+         source_allocation_id, source_type, source_id, source_center_id, source_child_id, source_category_id, source_system, etl_batch_id, loaded_at)
+        SELECT ISNULL(dd.TimeKey,-1),
+               CASE WHEN LOWER(ISNULL(a.source_type,N''))=N'donation' THEN ISNULL(donor.donor_key,-1) ELSE -1 END,
+               ISNULL(c.center_key,-1), ISNULL(ch.child_key,-1), ISNULL(cat.category_key,-1),
+               CASE WHEN LOWER(ISNULL(a.source_type,N''))=N'donation' THEN ISNULL(camp.campaign_key,-1) ELSE -1 END,
+               ISNULL(at.allocation_type_key,-1),
+               a.allocated_amount, a.reason, a.id, a.source_type, a.source_id, a.center_id, a.child_id, a.category_id, a.source_system, @etl_batch_id, SYSDATETIME()
+        FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations a
+        INNER JOIN (
+            SELECT id, MAX(stg_row_id) AS max_stg_row_id
+            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations
+            WHERE is_valid = 1 AND id IS NOT NULL
+            GROUP BY id
+        ) a_latest ON a_latest.max_stg_row_id = a.stg_row_id
+        LEFT JOIN (
+            SELECT sd1.*
+            FROM Stg_FinanceOps_DB.stg_finance_ops.donations sd1
+            INNER JOIN (
+                SELECT id, MAX(stg_row_id) AS max_stg_row_id
+                FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+                WHERE is_valid = 1 AND id IS NOT NULL
+                GROUP BY id
+            ) sd_latest ON sd_latest.max_stg_row_id = sd1.stg_row_id
+        ) sd ON LOWER(ISNULL(a.source_type,N''))=N'donation' AND sd.id = a.source_id AND sd.is_valid=1
+        LEFT JOIN dw.dim_date dd ON dd.FullDateAlternateKey = a.allocation_date
+        LEFT JOIN (SELECT donor_id, MIN(donor_key) AS donor_key FROM dw.dim_donor GROUP BY donor_id) donor ON donor.donor_id = sd.donor_id
+        LEFT JOIN (SELECT campaign_id, MIN(campaign_key) AS campaign_key FROM dw.dim_campaign GROUP BY campaign_id) camp ON camp.campaign_id = sd.campaign_id
+        LEFT JOIN (SELECT center_id, MIN(center_key) AS center_key FROM dw.dim_center GROUP BY center_id) c ON c.center_id = a.center_id
+        LEFT JOIN (SELECT child_id, MIN(child_key) AS child_key FROM dw.dim_child GROUP BY child_id) ch ON ch.child_id = a.child_id
+        LEFT JOIN (SELECT category_id, MIN(category_key) AS category_key FROM dw.dim_category GROUP BY category_id) cat ON cat.category_id = a.category_id
+        LEFT JOIN (SELECT code, MIN(allocation_type_key) AS allocation_type_key FROM dw.dim_allocation_type GROUP BY code) at ON at.code = LOWER(LTRIM(RTRIM(a.source_type)))
+        WHERE a.is_valid=1 AND a.id IS NOT NULL AND CONVERT(DATETIME2(0), a.allocation_date) >= @start_time AND CONVERT(DATETIME2(0), a.allocation_date) < @end_time;
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_budget_allocation_event_load;
         BEGIN TRANSACTION;
-
-        SET @step_started_at = SYSDATETIME();
-        TRUNCATE TABLE dw.fact_budget_allocation_event;
-        SET @rows_deleted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'succeeded', @rows_deleted, @rows_deleted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Truncated dw.fact_budget_allocation_event for first load.');
-
-        SET @step_started_at = SYSDATETIME();
-        DBCC CHECKIDENT (N'dw.fact_budget_allocation_event', RESEED, 0) WITH NO_INFOMSGS;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Reset fact identity seed to 0 for first load.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        INSERT INTO dw.fact_budget_allocation_event
-        (
-              date_key,
-              donor_key,
-              center_key,
-              child_key,
-              category_key,
-              campaign_key,
-              allocation_type_key,
-              allocated_amount,
-              reason,
-              source_allocation_id,
-              source_type,
-              source_id,
-              source_center_id,
-              source_child_id,
-              source_category_id,
-              source_system,
-              etl_batch_id,
-              loaded_at
-        )
-        SELECT
-              aw.date_key,
-              aw.donor_key,
-              aw.center_key,
-              aw.child_key,
-              aw.category_key,
-              aw.campaign_key,
-              aw.allocation_type_key,
-              aw.allocated_amount,
-              aw.reason,
-              aw.source_allocation_id,
-              aw.source_type,
-              aw.source_id,
-              aw.source_center_id,
-              aw.source_child_id,
-              aw.source_category_id,
-              aw.source_system,
-              @etl_batch_id,
-              SYSDATETIME()
-        FROM #allocation_work AS aw;
-
-        SET @rows_fact_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#allocation_work',
-             N'Charity_DW_DB', N'dw', N'fact_budget_allocation_event',
-             N'succeeded', @rows_fact_inserted, @rows_fact_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Inserted first-load rows into dw.fact_budget_allocation_event.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-        SET
-              load_status = N'succeeded',
-              rows_read = @rows_read_total,
-              rows_inserted = @rows_fact_inserted,
-              rows_rejected = @rows_rejected_total,
-              ended_at = SYSDATETIME(),
-              message = CONCAT(
-                    N'Succeeded first load for dw.fact_budget_allocation_event. Work inserted: ', @rows_work_inserted_total,
-                    N'; work updated: ', @rows_work_updated_total,
-                    N'; fact inserted: ', @rows_fact_inserted,
-                    N'; rejected source rows: ', @rows_rejected_total, N'.')
-        WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET
-                  load_status = N'failed',
-                  ended_at = SYSDATETIME(),
-                  message = CONCAT(N'Failed first load for dw.fact_budget_allocation_event. Error: ', @error_message)
-            WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            TRUNCATE TABLE dw.fact_budget_allocation_event;
+            DBCC CHECKIDENT ('dw.fact_budget_allocation_event', RESEED, -1);
+            INSERT INTO dw.fact_budget_allocation_event
+            (date_key, donor_key, center_key, child_key, category_key, campaign_key, allocation_type_key, allocated_amount, reason,
+             source_allocation_id, source_type, source_id, source_center_id, source_child_id, source_category_id, source_system, etl_batch_id, loaded_at)
+            SELECT t.date_key, t.donor_key, t.center_key, t.child_key, t.category_key, t.campaign_key, t.allocation_type_key, t.allocated_amount, t.reason,
+                   t.source_allocation_id, t.source_type, t.source_id, t.source_center_id, t.source_child_id, t.source_category_id, t.source_system, t.etl_batch_id, t.loaded_at
+            FROM etl_work.tmp_fact_budget_allocation_event_load t
+            WHERE NOT EXISTS (SELECT 1 FROM dw.fact_budget_allocation_event f WHERE f.source_allocation_id=t.source_allocation_id);
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'fact_budget_allocation_event', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Event/factless-style fact append-only load. No updates.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-
-
-
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 23_create_dw_fact_monthly_financial_snapshot_etl_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two practical ETL procedures for loading
-   dw.fact_monthly_financial_snapshot from Finance staging tables.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_fact_monthly_financial_snapshot
-      - First/full load for selected period months.
-      - Builds month and movement temp tables.
-      - Truncates dw.fact_monthly_financial_snapshot.
-      - Resets identity so the first real fact key starts from 1.
-      - Inserts one row per month / center with monthly financial totals.
-
-   2. etl_admin.usp_load_dw_fact_monthly_financial_snapshot_incremental
-      - Incremental/normal load.
-      - Finds months affected by the input period and by source-row changes.
-      - Rebuilds complete affected month snapshots.
-      - Deletes existing target rows for affected months and inserts recalculated rows.
-      - Resets identity seed to the current MAX(monthly_financial_snapshot_key).
-
- Fact Type Decision:
-   - dw.fact_monthly_financial_snapshot is a PERIODIC SNAPSHOT FACT.
-   - It has a month_key, so it is not an accumulating fact.
-   - Measures are calculated for the snapshot month only, not from all historical
-     time to the present.
-
- Grain:
-   - One row per month_key / center_key.
-
- Business Rules:
-   - total_donation_amount:
-       Sum of budget allocation amounts whose source_type = 'donation'.
-       Because source donations do not contain center_id, center-level donation
-       value is derived through budget_allocations.
-       If the linked donation exists, only confirmed donations are counted.
-   - total_expense_amount:
-       Sum of approved expenses by expense_date and center_id.
-   - total_payment_amount:
-       Sum of paid payments by payment_date and center_id.
-   - net_balance:
-       total_donation_amount - total_expense_amount - total_payment_amount.
-   - donation_count:
-       Count of distinct donation source_ids allocated to the center in the month.
-   - expense_count:
-       Count of approved expense rows in the month.
-   - payment_count:
-       Count of paid payment rows in the month.
-   - allocation_count:
-       Count of all valid budget allocation events in the month.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys / clustered keys where useful.
-   - Dimension lookup failures use unknown keys = -1.
-   - The month/date dimension must contain the month-end date. Missing month-end
-     dates are logged and excluded to avoid corrupt month_key = -1 snapshots.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.fact_monthly_financial_snapshot
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_monthly_financial_snapshot
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    DECLARE @month_start DATE = DATEFROMPARTS(YEAR(CONVERT(DATE,@start_time)), MONTH(CONVERT(DATE,@start_time)), 1);
+    DECLARE @period_end DATE = CONVERT(DATE, @end_time);
+    DECLARE @month_end DATE, @month_key INT;
 
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @period_start_date DATE,
-          @period_last_date DATE,
-          @month_cursor DATE,
-          @current_month_key INT,
-          @current_month_start DATE,
-          @current_month_end DATE,
-          @current_month_end_exclusive DATE,
-          @rows_inserted INT = 0,
-          @rows_deleted INT = 0,
-          @rows_read INT = 0,
-          @rows_rejected INT = 0,
-          @rows_months INT = 0,
-          @rows_fact_inserted INT = 0,
-          @rows_work_total INT = 0,
-          @rows_rejected_total INT = 0,
-          @identity_seed BIGINT = 0,
-          @date_lookup_sql NVARCHAR(MAX),
-          @center_lookup_sql NVARCHAR(MAX),
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52701, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52702, '@start_time must be earlier than @end_time.', 1;
-    END;
-
-    IF OBJECT_ID(N'dw.fact_monthly_financial_snapshot', N'U') IS NULL
-    BEGIN
-        THROW 52703, 'Missing target table dw.fact_monthly_financial_snapshot.', 1;
-    END;
-
-    IF OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.budget_allocations', N'U') IS NULL
-       OR OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.expenses', N'U') IS NULL
-       OR OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.payments', N'U') IS NULL
-       OR OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.donations', N'U') IS NULL
-    BEGIN
-        THROW 52704, 'Missing one or more required staging finance tables.', 1;
-    END;
-
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT_SNAPSHOT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_FACT', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
+        TRUNCATE TABLE etl_work.tmp_fact_monthly_snapshot_load;
 
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'finance_snapshot_sources',
-             N'Charity_DW_DB', N'dw', N'fact_monthly_financial_snapshot',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.fact_monthly_financial_snapshot. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        /*---------------------------------------------------------------------
-          Create date lookup.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_date
-        (
-              date_value DATE NOT NULL PRIMARY KEY,
-              date_key   INT  NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_date', N'FullDateAlternateKey') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'TimeKey') IS NOT NULL
+        WHILE @month_start < @period_end
         BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDateAlternateKey AS DATE), MIN(TimeKey)
-                FROM dw.dim_date
-                WHERE FullDateAlternateKey IS NOT NULL
-                  AND ISNULL(TimeKey, -1) <> -1
-                GROUP BY CAST(FullDateAlternateKey AS DATE);';
+            SET @month_end = EOMONTH(@month_start);
+            SELECT @month_key = MAX(TimeKey)
+            FROM dw.dim_date
+            WHERE FullDateAlternateKey >= @month_start AND FullDateAlternateKey <= @month_end;
+
+            IF @month_key IS NOT NULL
+            BEGIN
+                INSERT INTO etl_work.tmp_fact_monthly_snapshot_load
+                (month_key, center_key, total_donation_amount, total_expense_amount, total_payment_amount, net_balance,
+                 donation_count, expense_count, payment_count, allocation_count, source_system, etl_batch_id, loaded_at)
+                SELECT
+                    @month_key,
+                    c.center_key,
+                    ISNULL(don.total_donation_amount, 0),
+                    ISNULL(exp.total_expense_amount, 0),
+                    ISNULL(pay.total_payment_amount, 0),
+                    ISNULL(don.total_donation_amount, 0) - ISNULL(exp.total_expense_amount, 0) - ISNULL(pay.total_payment_amount, 0),
+                    ISNULL(don.donation_count, 0),
+                    ISNULL(exp.expense_count, 0),
+                    ISNULL(pay.payment_count, 0),
+                    ISNULL(alloc.allocation_count, 0),
+                    N'FINANCE_OPS',
+                    @etl_batch_id,
+                    SYSDATETIME()
+                FROM dw.dim_center c
+                OUTER APPLY (
+                    SELECT SUM(a.allocated_amount) AS total_donation_amount,
+                           COUNT(DISTINCT a.source_id) AS donation_count
+                    FROM dw.fact_budget_allocation_event a
+                    JOIN dw.fact_donation_transaction d ON d.source_donation_id = a.source_id
+                    WHERE a.center_key = c.center_key
+                      AND LOWER(ISNULL(a.source_type,N'')) = N'donation'
+                      AND d.is_confirmed = 1
+                      AND ISNULL(d.is_refunded,0) = 0
+                      AND a.date_key BETWEEN CONVERT(INT, CONVERT(CHAR(8), @month_start, 112)) AND @month_key
+                ) don
+                OUTER APPLY (
+                    SELECT SUM(e.amount) AS total_expense_amount,
+                           COUNT(*) AS expense_count
+                    FROM dw.fact_expense_transaction e
+                    WHERE e.center_key = c.center_key
+                      AND e.is_approved = 1
+                      AND e.date_key BETWEEN CONVERT(INT, CONVERT(CHAR(8), @month_start, 112)) AND @month_key
+                ) exp
+                OUTER APPLY (
+                    SELECT SUM(p.amount) AS total_payment_amount,
+                           COUNT(*) AS payment_count
+                    FROM dw.fact_payment_transaction p
+                    WHERE p.center_key = c.center_key
+                      AND p.is_paid = 1
+                      AND p.date_key BETWEEN CONVERT(INT, CONVERT(CHAR(8), @month_start, 112)) AND @month_key
+                ) pay
+                OUTER APPLY (
+                    SELECT COUNT(*) AS allocation_count
+                    FROM dw.fact_budget_allocation_event a2
+                    WHERE a2.center_key = c.center_key
+                      AND a2.date_key BETWEEN CONVERT(INT, CONVERT(CHAR(8), @month_start, 112)) AND @month_key
+                ) alloc;
+            END
+            SET @month_start = DATEADD(MONTH, 1, @month_start);
         END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'full_date') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'date_key') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(full_date AS DATE), MIN(date_key)
-                FROM dw.dim_date
-                WHERE full_date IS NOT NULL
-                  AND ISNULL(date_key, -1) <> -1
-                GROUP BY CAST(full_date AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'FullDate') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_date', N'DateKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDate AS DATE), MIN(DateKey)
-                FROM dw.dim_date
-                WHERE FullDate IS NOT NULL
-                  AND ISNULL(DateKey, -1) <> -1
-                GROUP BY CAST(FullDate AS DATE);';
-        END
-        ELSE
-        BEGIN
-            THROW 52705, 'Cannot resolve dw.dim_date columns. Expected (TimeKey, FullDateAlternateKey), (date_key, full_date), or (DateKey, FullDate).', 1;
-        END;
 
-        EXEC sys.sp_executesql @date_lookup_sql;
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_date',
-             N'tempdb', N'#', N'#dim_date',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_date lookup table.');
-
-        /*---------------------------------------------------------------------
-          Create center lookup.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_center
-        (
-              source_center_id BIGINT NOT NULL PRIMARY KEY,
-              center_key       INT    NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_center', N'center_id') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_center', N'center_key') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, center_id), MIN(center_key)
-                FROM dw.dim_center
-                WHERE center_id IS NOT NULL
-                  AND ISNULL(center_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, center_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_center', N'source_center_id') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_center', N'center_key') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, source_center_id), MIN(center_key)
-                FROM dw.dim_center
-                WHERE source_center_id IS NOT NULL
-                  AND ISNULL(center_key, -1) <> -1
-                GROUP BY CONVERT(BIGINT, source_center_id);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_center', N'CenterID') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_center', N'CenterKey') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, CenterID), MIN(CenterKey)
-                FROM dw.dim_center
-                WHERE CenterID IS NOT NULL
-                  AND ISNULL(CenterKey, -1) <> -1
-                GROUP BY CONVERT(BIGINT, CenterID);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_center', N'SourceCenterID') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_center', N'CenterKey') IS NOT NULL
-        BEGIN
-            SET @center_lookup_sql = N'
-                INSERT INTO #dim_center (source_center_id, center_key)
-                SELECT CONVERT(BIGINT, SourceCenterID), MIN(CenterKey)
-                FROM dw.dim_center
-                WHERE SourceCenterID IS NOT NULL
-                  AND ISNULL(CenterKey, -1) <> -1
-                GROUP BY CONVERT(BIGINT, SourceCenterID);';
-        END
-        ELSE
-        BEGIN
-            THROW 52706, 'Cannot resolve dw.dim_center columns. Expected source center id and center key columns.', 1;
-        END;
-
-        EXEC sys.sp_executesql @center_lookup_sql;
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_center',
-             N'tempdb', N'#', N'#dim_center',
-             N'succeeded', @rows_inserted, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created and loaded #dim_center lookup table.');
-
-        /*---------------------------------------------------------------------
-          Build snapshot months from the requested period.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #snapshot_month_candidates
-        (
-              month_end_date DATE NOT NULL PRIMARY KEY
-        );
-
-        SET @period_start_date = CAST(@start_time AS DATE);
-        SET @period_last_date = CASE
-                                    WHEN @end_time = CONVERT(DATETIME2(0), CAST(@end_time AS DATE))
-                                        THEN DATEADD(DAY, -1, CAST(@end_time AS DATE))
-                                    ELSE CAST(@end_time AS DATE)
-                                END;
-
-        SET @month_cursor = DATEFROMPARTS(YEAR(@period_start_date), MONTH(@period_start_date), 1);
-
-        WHILE @month_cursor <= DATEFROMPARTS(YEAR(@period_last_date), MONTH(@period_last_date), 1)
-        BEGIN
-            INSERT INTO #snapshot_month_candidates (month_end_date)
-            SELECT EOMONTH(@month_cursor)
-            WHERE NOT EXISTS
-            (
-                SELECT 1
-                FROM #snapshot_month_candidates
-                WHERE month_end_date = EOMONTH(@month_cursor)
-            );
-
-            SET @rows_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'procedure', N'etl_admin', N'period_month_loop',
-                 N'tempdb', N'#', N'#snapshot_month_candidates',
-                 N'succeeded', 1, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Added month candidate from requested period: ', CONVERT(NVARCHAR(10), EOMONTH(@month_cursor), 120), N'.'));
-
-            SET @step_started_at = SYSDATETIME();
-            SET @month_cursor = DATEADD(MONTH, 1, @month_cursor);
-        END;
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #snapshot_months
-        (
-              month_key                 INT  NOT NULL PRIMARY KEY,
-              month_start_date          DATE NOT NULL,
-              month_end_date            DATE NOT NULL,
-              month_end_exclusive_date  DATE NOT NULL
-        );
-
-        INSERT INTO #snapshot_months
-            (month_key, month_start_date, month_end_date, month_end_exclusive_date)
-        SELECT
-              D.date_key,
-              DATEFROMPARTS(YEAR(C.month_end_date), MONTH(C.month_end_date), 1),
-              C.month_end_date,
-              DATEADD(DAY, 1, C.month_end_date)
-        FROM #snapshot_month_candidates C
-        JOIN #dim_date D
-             ON D.date_value = C.month_end_date;
-
-        SET @rows_months = @@ROWCOUNT;
-
-        SELECT @rows_rejected = COUNT(1)
-        FROM #snapshot_month_candidates C
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-            FROM #dim_date D
-            WHERE D.date_value = C.month_end_date
-        );
-
-        SET @rows_rejected_total += ISNULL(@rows_rejected, 0);
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#snapshot_month_candidates',
-             N'tempdb', N'#', N'#snapshot_months',
-             N'succeeded', @rows_months + @rows_rejected, @rows_months,
-             0, @rows_rejected,
-             @step_started_at, SYSDATETIME(), N'Created #snapshot_months with month-end date keys.');
-
-        /*---------------------------------------------------------------------
-          Build monthly movement table month by month.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #CurrentMonthMovement
-        (
-              month_key               INT NOT NULL,
-              source_center_id        BIGINT NOT NULL,
-              center_key              INT NOT NULL,
-              total_donation_amount   DECIMAL(18,2) NOT NULL,
-              total_expense_amount    DECIMAL(18,2) NOT NULL,
-              total_payment_amount    DECIMAL(18,2) NOT NULL,
-              donation_count          INT NOT NULL,
-              expense_count           INT NOT NULL,
-              payment_count           INT NOT NULL,
-              allocation_count        INT NOT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'procedure', N'etl_admin', N'create_temp_table',
-             N'tempdb', N'#', N'#CurrentMonthMovement',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created #CurrentMonthMovement temp table.');
-
-        DECLARE month_cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT month_key, month_start_date, month_end_date, month_end_exclusive_date
-            FROM #snapshot_months
-            ORDER BY month_start_date;
-
-        OPEN month_cur;
-        FETCH NEXT FROM month_cur
-            INTO @current_month_key, @current_month_start, @current_month_end, @current_month_end_exclusive;
-
-        WHILE @@FETCH_STATUS = 0
-        BEGIN
-            /* Donation amount from donation-based allocations */
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #CurrentMonthMovement
-                (month_key, source_center_id, center_key,
-                 total_donation_amount, total_expense_amount, total_payment_amount,
-                 donation_count, expense_count, payment_count, allocation_count)
-            SELECT
-                  @current_month_key,
-                  CONVERT(BIGINT, BA.center_id),
-                  ISNULL(DC.center_key, -1),
-                  SUM(ISNULL(BA.allocated_amount, 0)),
-                  CONVERT(DECIMAL(18,2), 0),
-                  CONVERT(DECIMAL(18,2), 0),
-                  COUNT(DISTINCT BA.source_id),
-                  0,
-                  0,
-                  0
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations BA
-            LEFT JOIN Stg_FinanceOps_DB.stg_finance_ops.donations D
-                   ON LOWER(LTRIM(RTRIM(ISNULL(BA.source_type, N'')))) = N'donation'
-                  AND BA.source_id = D.id
-                  AND D.is_valid = 1
-            LEFT JOIN #dim_center DC
-                   ON DC.source_center_id = CONVERT(BIGINT, BA.center_id)
-            WHERE BA.is_valid = 1
-              AND LOWER(LTRIM(RTRIM(ISNULL(BA.source_type, N'')))) = N'donation'
-              AND BA.allocation_date >= @current_month_start
-              AND BA.allocation_date <  @current_month_end_exclusive
-              AND BA.center_id IS NOT NULL
-              AND (D.id IS NULL OR LOWER(LTRIM(RTRIM(ISNULL(D.status, N'')))) = N'confirmed')
-            GROUP BY CONVERT(BIGINT, BA.center_id), ISNULL(DC.center_key, -1);
-
-            SET @rows_inserted = @@ROWCOUNT;
-            SET @rows_work_total += ISNULL(@rows_inserted, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations/donations',
-                 N'tempdb', N'#', N'#CurrentMonthMovement',
-                 N'succeeded', NULL, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted donation allocation movement for month_key ', @current_month_key, N'.'));
-
-            /* Expense amount */
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #CurrentMonthMovement
-                (month_key, source_center_id, center_key,
-                 total_donation_amount, total_expense_amount, total_payment_amount,
-                 donation_count, expense_count, payment_count, allocation_count)
-            SELECT
-                  @current_month_key,
-                  CONVERT(BIGINT, E.center_id),
-                  ISNULL(DC.center_key, -1),
-                  CONVERT(DECIMAL(18,2), 0),
-                  SUM(ISNULL(E.amount, 0)),
-                  CONVERT(DECIMAL(18,2), 0),
-                  0,
-                  COUNT(1),
-                  0,
-                  0
-            FROM Stg_FinanceOps_DB.stg_finance_ops.expenses E
-            LEFT JOIN #dim_center DC
-                   ON DC.source_center_id = CONVERT(BIGINT, E.center_id)
-            WHERE E.is_valid = 1
-              AND LOWER(LTRIM(RTRIM(ISNULL(E.status, N'')))) = N'approved'
-              AND E.expense_date >= @current_month_start
-              AND E.expense_date <  @current_month_end_exclusive
-              AND E.center_id IS NOT NULL
-            GROUP BY CONVERT(BIGINT, E.center_id), ISNULL(DC.center_key, -1);
-
-            SET @rows_inserted = @@ROWCOUNT;
-            SET @rows_work_total += ISNULL(@rows_inserted, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'expenses',
-                 N'tempdb', N'#', N'#CurrentMonthMovement',
-                 N'succeeded', NULL, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted approved expense movement for month_key ', @current_month_key, N'.'));
-
-            /* Payment amount */
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #CurrentMonthMovement
-                (month_key, source_center_id, center_key,
-                 total_donation_amount, total_expense_amount, total_payment_amount,
-                 donation_count, expense_count, payment_count, allocation_count)
-            SELECT
-                  @current_month_key,
-                  CONVERT(BIGINT, P.center_id),
-                  ISNULL(DC.center_key, -1),
-                  CONVERT(DECIMAL(18,2), 0),
-                  CONVERT(DECIMAL(18,2), 0),
-                  SUM(ISNULL(P.amount, 0)),
-                  0,
-                  0,
-                  COUNT(1),
-                  0
-            FROM Stg_FinanceOps_DB.stg_finance_ops.payments P
-            LEFT JOIN #dim_center DC
-                   ON DC.source_center_id = CONVERT(BIGINT, P.center_id)
-            WHERE P.is_valid = 1
-              AND LOWER(LTRIM(RTRIM(ISNULL(P.status, N'')))) = N'paid'
-              AND P.payment_date >= @current_month_start
-              AND P.payment_date <  @current_month_end_exclusive
-              AND P.center_id IS NOT NULL
-            GROUP BY CONVERT(BIGINT, P.center_id), ISNULL(DC.center_key, -1);
-
-            SET @rows_inserted = @@ROWCOUNT;
-            SET @rows_work_total += ISNULL(@rows_inserted, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'payments',
-                 N'tempdb', N'#', N'#CurrentMonthMovement',
-                 N'succeeded', NULL, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted paid payment movement for month_key ', @current_month_key, N'.'));
-
-            /* Allocation count, all allocation source types */
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #CurrentMonthMovement
-                (month_key, source_center_id, center_key,
-                 total_donation_amount, total_expense_amount, total_payment_amount,
-                 donation_count, expense_count, payment_count, allocation_count)
-            SELECT
-                  @current_month_key,
-                  CONVERT(BIGINT, BA.center_id),
-                  ISNULL(DC.center_key, -1),
-                  CONVERT(DECIMAL(18,2), 0),
-                  CONVERT(DECIMAL(18,2), 0),
-                  CONVERT(DECIMAL(18,2), 0),
-                  0,
-                  0,
-                  0,
-                  COUNT(1)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations BA
-            LEFT JOIN #dim_center DC
-                   ON DC.source_center_id = CONVERT(BIGINT, BA.center_id)
-            WHERE BA.is_valid = 1
-              AND BA.allocation_date >= @current_month_start
-              AND BA.allocation_date <  @current_month_end_exclusive
-              AND BA.center_id IS NOT NULL
-            GROUP BY CONVERT(BIGINT, BA.center_id), ISNULL(DC.center_key, -1);
-
-            SET @rows_inserted = @@ROWCOUNT;
-            SET @rows_work_total += ISNULL(@rows_inserted, 0);
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-                 N'tempdb', N'#', N'#CurrentMonthMovement',
-                 N'succeeded', NULL, @rows_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Inserted allocation count movement for month_key ', @current_month_key, N'.'));
-
-            FETCH NEXT FROM month_cur
-                INTO @current_month_key, @current_month_start, @current_month_end, @current_month_end_exclusive;
-        END;
-
-        CLOSE month_cur;
-        DEALLOCATE month_cur;
-
-        /*---------------------------------------------------------------------
-          Aggregate movement into final snapshot grain.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #NewSnapshot
-        (
-              month_key               INT NOT NULL,
-              center_key              INT NOT NULL,
-              total_donation_amount   DECIMAL(18,2) NOT NULL,
-              total_expense_amount    DECIMAL(18,2) NOT NULL,
-              total_payment_amount    DECIMAL(18,2) NOT NULL,
-              net_balance             DECIMAL(18,2) NOT NULL,
-              donation_count          INT NOT NULL,
-              expense_count           INT NOT NULL,
-              payment_count           INT NOT NULL,
-              allocation_count        INT NOT NULL,
-              PRIMARY KEY CLUSTERED (month_key, center_key)
-        );
-
-        INSERT INTO #NewSnapshot
-            (month_key, center_key,
-             total_donation_amount, total_expense_amount, total_payment_amount, net_balance,
-             donation_count, expense_count, payment_count, allocation_count)
-        SELECT
-              M.month_key,
-              M.center_key,
-              SUM(M.total_donation_amount),
-              SUM(M.total_expense_amount),
-              SUM(M.total_payment_amount),
-              SUM(M.total_donation_amount) - SUM(M.total_expense_amount) - SUM(M.total_payment_amount),
-              SUM(M.donation_count),
-              SUM(M.expense_count),
-              SUM(M.payment_count),
-              SUM(M.allocation_count)
-        FROM #CurrentMonthMovement M
-        GROUP BY M.month_key, M.center_key;
-
-        SET @rows_inserted = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#CurrentMonthMovement',
-             N'tempdb', N'#', N'#NewSnapshot',
-             N'succeeded', @rows_work_total, @rows_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Aggregated #CurrentMonthMovement into #NewSnapshot at month/center grain.');
-
-        /*---------------------------------------------------------------------
-          First load into target.
-        ---------------------------------------------------------------------*/
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_monthly_snapshot_load;
         BEGIN TRANSACTION;
-
-            SET @step_started_at = SYSDATETIME();
-
             TRUNCATE TABLE dw.fact_monthly_financial_snapshot;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_monthly_financial_snapshot',
-                 N'Charity_DW_DB', N'dw', N'fact_monthly_financial_snapshot',
-                 N'succeeded', NULL, @rows_deleted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Truncated dw.fact_monthly_financial_snapshot for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-            DBCC CHECKIDENT ('dw.fact_monthly_financial_snapshot', RESEED, 0) WITH NO_INFOMSGS;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'procedure', N'etl_admin', N'identity_reset',
-                 N'Charity_DW_DB', N'dw', N'fact_monthly_financial_snapshot',
-                 N'succeeded', 0, 0,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Reset identity seed to 0 for first load.');
-
-            SET @step_started_at = SYSDATETIME();
-
+            DBCC CHECKIDENT ('dw.fact_monthly_financial_snapshot', RESEED, -1);
             INSERT INTO dw.fact_monthly_financial_snapshot
-                (month_key, center_key,
-                 total_donation_amount, total_expense_amount, total_payment_amount, net_balance,
-                 donation_count, expense_count, payment_count, allocation_count,
-                 source_system, etl_batch_id, loaded_at)
-            SELECT
-                 month_key,
-                 center_key,
-                 total_donation_amount,
-                 total_expense_amount,
-                 total_payment_amount,
-                 net_balance,
-                 donation_count,
-                 expense_count,
-                 payment_count,
-                 allocation_count,
-                 N'FINANCE_OPS',
-                 @etl_batch_id,
-                 SYSDATETIME()
-            FROM #NewSnapshot;
-
-            SET @rows_fact_inserted = @@ROWCOUNT;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'tempdb', N'#', N'#NewSnapshot',
-                 N'Charity_DW_DB', N'dw', N'fact_monthly_financial_snapshot',
-                 N'succeeded', @rows_fact_inserted, @rows_fact_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(), N'Inserted first-load monthly financial snapshot rows.');
-
-        COMMIT TRANSACTION;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-        SET load_status = N'succeeded',
-            rows_read = @rows_work_total,
-            rows_inserted = @rows_fact_inserted,
-            rows_rejected = @rows_rejected_total,
-            ended_at = SYSDATETIME(),
-            message = CONCAT(N'First load completed for dw.fact_monthly_financial_snapshot. Months loaded: ',
-                             @rows_months, N'. Fact rows inserted: ', @rows_fact_inserted, N'.')
-        WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF CURSOR_STATUS('local', 'month_cur') >= -1
-        BEGIN
-            CLOSE month_cur;
-            DEALLOCATE month_cur;
-        END;
-
-        IF XACT_STATE() <> 0
-        BEGIN
-            ROLLBACK TRANSACTION;
-        END;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET load_status = N'failed',
-                ended_at = SYSDATETIME(),
-                message = CONCAT(ISNULL(message, N''), N' Error: ', @error_message)
-            WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            (month_key, center_key, total_donation_amount, total_expense_amount, total_payment_amount, net_balance,
+             donation_count, expense_count, payment_count, allocation_count, source_system, etl_batch_id, loaded_at)
+            SELECT t.month_key, t.center_key, t.total_donation_amount, t.total_expense_amount, t.total_payment_amount, t.net_balance,
+                   t.donation_count, t.expense_count, t.payment_count, t.allocation_count, t.source_system, t.etl_batch_id, t.loaded_at
+            FROM etl_work.tmp_fact_monthly_snapshot_load t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dw.fact_monthly_financial_snapshot f
+                WHERE f.month_key = t.month_key AND f.center_key = t.center_key
+            );
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'dw_fact_transactions', N'fact_monthly_financial_snapshot', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Append-only monthly snapshot from DW facts. WHILE loop used only here.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL
- File         : 24_create_dw_fact_donation_lifecycle_etl_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two practical ETL procedures for loading dw.fact_donation_lifecycle
-   from Stg_FinanceOps_DB.stg_finance_ops.donations and
-   Stg_FinanceOps_DB.stg_finance_ops.budget_allocations.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_fact_donation_lifecycle
-      - First/full load for a selected period.
-      - Builds the affected donation set day by day.
-      - Truncates dw.fact_donation_lifecycle.
-      - Resets the identity seed so the first real fact key starts from 1.
-      - Inserts one accumulating lifecycle row per donation.
-
-   2. etl_admin.usp_load_dw_fact_donation_lifecycle_incremental
-      - Incremental/normal load for a selected period.
-      - Builds the affected donation set day by day from donation changes and
-        allocation changes.
-      - Resets identity seed to MAX(donation_lifecycle_key).
-      - Deletes affected donation lifecycle rows.
-      - Recalculates the complete lifecycle state for those donations from all
-        available staging data, not only from the requested period.
-
- Fact Type Decision:
-   - dw.fact_donation_lifecycle is an ACCUMULATING SNAPSHOT FACT.
-   - It has multiple milestone dates: created, confirmed, allocated.
-   - The input period decides which source donation ids are affected.
-   - The measures and milestone dates are then recalculated from all available
-     staging history for those affected donation ids.
-   - This matches the accumulative-fact rule: values are not computed only inside
-     the single load period.
-
- Grain:
-   - One row per source donation lifecycle.
-
- Business Rules:
-   - created_date_key:
-       CAST(COALESCE(donations.created_at, donations.donation_date) AS DATE)
-   - confirmed_date_key:
-       donations.donation_date when status IN ('confirmed', 'refunded')
-       otherwise unknown key = -1.
-   - allocated_date_key:
-       MIN(budget_allocations.allocation_date) for allocation rows where
-       source_type = 'donation' and source_id = donation id.
-   - lifecycle_status_key:
-       dw.dim_status where status_type = 'donation' and code = normalized status.
-   - current_stage:
-       refunded  -> 'refunded'
-       rejected  -> 'rejected'
-       allocated -> 'allocated'
-       confirmed -> 'confirmed'
-       otherwise -> 'created'
-   - days_to_confirm:
-       DATEDIFF(DAY, created_date, confirmed_date), floored at 0.
-   - days_to_allocate:
-       DATEDIFF(DAY, confirmed_date, allocated_date), floored at 0.
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - No MERGE.
-   - No window functions.
-   - Temp tables use simple primary keys for speed.
-   - Dimension lookup failures use unknown keys = -1.
-   - Step-level logs are written into:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - Batch rows are written into:
-       Charity_DW_DB.etl_admin.etl_batch
-===============================================================================
-*/
-
-/*=============================================================================
-  Procedure 1: First / Full Period Load for dw.fact_donation_lifecycle
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_donation_lifecycle
       @start_time DATETIME2(0),
       @end_time   DATETIME2(0)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @current_from DATETIME2(0),
-          @current_to DATETIME2(0),
-          @rows_deleted INT = 0,
-          @rows_inserted INT = 0,
-          @rows_read INT = 0,
-          @rows_rejected INT = 0,
-          @rows_loop_inserted INT = 0,
-          @rows_loop_alloc_inserted INT = 0,
-          @rows_loop_total INT = 0,
-          @rows_work_inserted INT = 0,
-          @rows_fact_inserted INT = 0,
-          @rows_lookup INT = 0,
-          @date_lookup_sql NVARCHAR(MAX),
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
-    BEGIN
-        THROW 52701, '@start_time and @end_time are required.', 1;
-    END;
-
-    IF @start_time >= @end_time
-    BEGIN
-        THROW 52702, '@start_time must be earlier than @end_time.', 1;
-    END;
-
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @etl_batch_id INT, @rows_read INT=0, @rows_inserted INT=0;
+    EXEC etl_admin.usp_dw_start_batch N'DW_FACT_LIFECYCLE', N'FINANCE_MART2', @etl_batch_id OUTPUT;
     BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_FACT', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
+        TRUNCATE TABLE etl_work.tmp_fact_donation_lifecycle_old;
+        TRUNCATE TABLE etl_work.tmp_fact_donation_lifecycle_current;
+        TRUNCATE TABLE etl_work.tmp_fact_donation_lifecycle_final;
+        
 
-        SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected, started_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations/budget_allocations',
-             N'Charity_DW_DB', N'dw', N'fact_donation_lifecycle',
-             N'running',
-             0,
-             0,
-             0,
-             0, SYSDATETIME(),
-             CONCAT(N'Start first load for dw.fact_donation_lifecycle. Period: [',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N', ',
-                    CONVERT(NVARCHAR(30), @end_time, 126), N').'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        /*---------------------------------------------------------------------
-          Dimension lookup temp tables.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_date
-        (
-              date_value DATE NOT NULL PRIMARY KEY,
-              date_key   INT  NOT NULL
-        );
-
-        IF COL_LENGTH(N'dw.dim_date', N'FullDateAlternateKey') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'TimeKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDateAlternateKey AS DATE), MIN(TimeKey)
-                FROM dw.dim_date
-                WHERE FullDateAlternateKey IS NOT NULL
-                  AND ISNULL(TimeKey, -1) <> -1
-                GROUP BY CAST(FullDateAlternateKey AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'full_date') IS NOT NULL
-           AND COL_LENGTH(N'dw.dim_date', N'date_key') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(full_date AS DATE), MIN(date_key)
-                FROM dw.dim_date
-                WHERE full_date IS NOT NULL
-                  AND ISNULL(date_key, -1) <> -1
-                GROUP BY CAST(full_date AS DATE);';
-        END
-        ELSE IF COL_LENGTH(N'dw.dim_date', N'FullDate') IS NOT NULL
-             AND COL_LENGTH(N'dw.dim_date', N'DateKey') IS NOT NULL
-        BEGIN
-            SET @date_lookup_sql = N'
-                INSERT INTO #dim_date (date_value, date_key)
-                SELECT CAST(FullDate AS DATE), MIN(DateKey)
-                FROM dw.dim_date
-                WHERE FullDate IS NOT NULL
-                  AND ISNULL(DateKey, -1) <> -1
-                GROUP BY CAST(FullDate AS DATE);';
-        END
-        ELSE
-        BEGIN
-            THROW 52703, 'Cannot resolve dw.dim_date columns. Expected (TimeKey, FullDateAlternateKey), (date_key, full_date), or (DateKey, FullDate).', 1;
-        END;
-
-        EXEC sys.sp_executesql @date_lookup_sql;
-        SET @rows_lookup = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_date',
-             N'tempdb', N'#', N'#dim_date',
-             N'succeeded', @rows_lookup, @rows_lookup,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Loaded date lookup temp table.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_donor
-        (
-              donor_id  INT NOT NULL PRIMARY KEY,
-              donor_key INT NOT NULL
-        );
-
-        INSERT INTO #dim_donor (donor_id, donor_key)
-        SELECT donor_id, MIN(donor_key)
-        FROM dw.dim_donor
-        WHERE donor_id IS NOT NULL
-          AND donor_id <> -1
-        GROUP BY donor_id;
-
-        SET @rows_lookup = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_donor',
-             N'tempdb', N'#', N'#dim_donor',
-             N'succeeded', @rows_lookup, @rows_lookup,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Loaded donor lookup temp table.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_campaign
-        (
-              campaign_id  INT NOT NULL PRIMARY KEY,
-              campaign_key INT NOT NULL
-        );
-
-        INSERT INTO #dim_campaign (campaign_id, campaign_key)
-        SELECT campaign_id, MIN(campaign_key)
-        FROM dw.dim_campaign
-        WHERE campaign_id IS NOT NULL
-          AND campaign_id <> -1
-        GROUP BY campaign_id;
-
-        SET @rows_lookup = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_campaign',
-             N'tempdb', N'#', N'#dim_campaign',
-             N'succeeded', @rows_lookup, @rows_lookup,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Loaded campaign lookup temp table.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #dim_status
-        (
-              status_code NVARCHAR(50) NOT NULL PRIMARY KEY,
-              status_key  INT NOT NULL
-        );
-
-        INSERT INTO #dim_status (status_code, status_key)
-        SELECT LOWER(LTRIM(RTRIM(code))) AS status_code,
-               MIN(status_key) AS status_key
-        FROM dw.dim_status
-        WHERE status_type = N'donation'
-          AND code IS NOT NULL
-          AND status_key <> -1
-        GROUP BY LOWER(LTRIM(RTRIM(code)));
-
-        SET @rows_lookup = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'dim_status',
-             N'tempdb', N'#', N'#dim_status',
-             N'succeeded', @rows_lookup, @rows_lookup,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Loaded donation-status lookup temp table.');
-
-        /*---------------------------------------------------------------------
-          Build affected donation ids day by day.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #affected_donation
-        (
-              source_donation_id BIGINT NOT NULL PRIMARY KEY
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations/budget_allocations',
-             N'tempdb', N'#', N'#affected_donation',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(), N'Created temp table for affected donation ids.');
-
-        SET @current_from = @start_time;
-
-        WHILE @current_from < @end_time
-        BEGIN
-            SET @current_to = DATEADD(DAY, 1, @current_from);
-            IF @current_to > @end_time SET @current_to = @end_time;
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #affected_donation (source_donation_id)
-            SELECT DISTINCT CONVERT(BIGINT, d.id)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.donations d
-            WHERE d.is_valid = 1
-              AND d.id IS NOT NULL
-              AND (
-                    (d.donation_date >= CAST(@current_from AS DATE) AND d.donation_date < CAST(@current_to AS DATE))
-                 OR (d.created_at >= @current_from AND d.created_at < @current_to)
-                 OR (d.updated_at >= @current_from AND d.updated_at < @current_to)
-                 OR (d.source_updated_at >= @current_from AND d.source_updated_at < @current_to)
-                 OR (d.extracted_at >= @current_from AND d.extracted_at < @current_to)
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM #affected_donation a
-                    WHERE a.source_donation_id = CONVERT(BIGINT, d.id)
-              );
-
-            SET @rows_loop_inserted = @@ROWCOUNT;
-            SET @rows_loop_total += @rows_loop_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-                 N'tempdb', N'#', N'#affected_donation',
-                 N'succeeded', @rows_loop_inserted, @rows_loop_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Added affected donations from donations for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO #affected_donation (source_donation_id)
-            SELECT DISTINCT CONVERT(BIGINT, ba.source_id)
-            FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations ba
-            WHERE ba.is_valid = 1
-              AND LOWER(LTRIM(RTRIM(ISNULL(ba.source_type, N'')))) = N'donation'
-              AND ba.source_id IS NOT NULL
-              AND (
-                    (ba.allocation_date >= CAST(@current_from AS DATE) AND ba.allocation_date < CAST(@current_to AS DATE))
-                 OR (ba.created_at >= @current_from AND ba.created_at < @current_to)
-                 OR (ba.source_updated_at >= @current_from AND ba.source_updated_at < @current_to)
-                 OR (ba.extracted_at >= @current_from AND ba.extracted_at < @current_to)
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM #affected_donation a
-                    WHERE a.source_donation_id = CONVERT(BIGINT, ba.source_id)
-              );
-
-            SET @rows_loop_alloc_inserted = @@ROWCOUNT;
-            SET @rows_loop_total += @rows_loop_alloc_inserted;
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-                 N'tempdb', N'#', N'#affected_donation',
-                 N'succeeded', @rows_loop_alloc_inserted, @rows_loop_alloc_inserted,
-                 0, 0,
-                 @step_started_at, SYSDATETIME(),
-                 CONCAT(N'Added affected donations from donation allocations for period [',
-                        CONVERT(NVARCHAR(30), @current_from, 126), N', ',
-                        CONVERT(NVARCHAR(30), @current_to, 126), N').'));
-
-            SET @current_from = @current_to;
-        END;
-
-        /*---------------------------------------------------------------------
-          Latest valid donation row per affected source donation id.
-          No window functions: use GROUP BY and MAX(stg_row_id).
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #latest_donation_stg
-        (
-              source_donation_id BIGINT NOT NULL PRIMARY KEY,
-              max_stg_row_id     BIGINT NOT NULL
-        );
-
-        INSERT INTO #latest_donation_stg (source_donation_id, max_stg_row_id)
-        SELECT CONVERT(BIGINT, d.id), MAX(d.stg_row_id)
-        FROM Stg_FinanceOps_DB.stg_finance_ops.donations d
-        JOIN #affected_donation a
-          ON a.source_donation_id = CONVERT(BIGINT, d.id)
-        WHERE d.is_valid = 1
-          AND d.id IS NOT NULL
-        GROUP BY CONVERT(BIGINT, d.id);
-
-        SET @rows_read = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations',
-             N'tempdb', N'#', N'#latest_donation_stg',
-             N'succeeded', @rows_read, @rows_read,
-             0, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Selected latest valid staging donation row for each affected donation.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #allocation_first
-        (
-              source_donation_id BIGINT NOT NULL PRIMARY KEY,
-              allocated_date     DATE NULL
-        );
-
-        INSERT INTO #allocation_first (source_donation_id, allocated_date)
-        SELECT CONVERT(BIGINT, ba.source_id) AS source_donation_id,
-               MIN(ba.allocation_date) AS allocated_date
-        FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations ba
-        JOIN #affected_donation a
-          ON a.source_donation_id = CONVERT(BIGINT, ba.source_id)
-        WHERE ba.is_valid = 1
-          AND LOWER(LTRIM(RTRIM(ISNULL(ba.source_type, N'')))) = N'donation'
-          AND ba.source_id IS NOT NULL
-          AND ba.allocation_date IS NOT NULL
-        GROUP BY CONVERT(BIGINT, ba.source_id);
-
-        SET @rows_read = @@ROWCOUNT;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'budget_allocations',
-             N'tempdb', N'#', N'#allocation_first',
-             N'succeeded', @rows_read, @rows_read,
-             0, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Calculated first allocation date for each affected donation using all available staging allocation rows.');
-
-        /*---------------------------------------------------------------------
-          Build lifecycle work table.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
-        CREATE TABLE #work_lifecycle
-        (
-              source_donation_id   BIGINT NOT NULL PRIMARY KEY,
-              source_donor_id      BIGINT NULL,
-              source_campaign_id   BIGINT NULL,
-              donor_key            INT NOT NULL,
-              campaign_key         INT NOT NULL,
-              created_date         DATE NULL,
-              confirmed_date       DATE NULL,
-              allocated_date       DATE NULL,
-              created_date_key     INT NOT NULL,
-              confirmed_date_key   INT NOT NULL,
-              allocated_date_key   INT NOT NULL,
-              lifecycle_status_key INT NOT NULL,
-              current_stage        NVARCHAR(50) NULL,
-              donation_amount      DECIMAL(18,2) NULL,
-              days_to_confirm      INT NULL,
-              days_to_allocate     INT NULL,
-              source_system        NVARCHAR(100) NULL
-        );
-
-        INSERT INTO #work_lifecycle
-        (
-              source_donation_id, source_donor_id, source_campaign_id,
-              donor_key, campaign_key,
-              created_date, confirmed_date, allocated_date,
-              created_date_key, confirmed_date_key, allocated_date_key,
-              lifecycle_status_key, current_stage, donation_amount,
-              days_to_confirm, days_to_allocate, source_system
-        )
+        INSERT INTO etl_work.tmp_fact_donation_lifecycle_current
+        (donor_key, campaign_key, created_date_key, confirmed_date_key, allocated_date_key, lifecycle_status_key,
+         current_stage, donation_amount, days_to_confirm, days_to_allocate, source_donation_id, source_donor_id, source_campaign_id, source_system, etl_batch_id, loaded_at)
         SELECT
-              CONVERT(BIGINT, d.id) AS source_donation_id,
-              CONVERT(BIGINT, d.donor_id) AS source_donor_id,
-              CONVERT(BIGINT, d.campaign_id) AS source_campaign_id,
-              ISNULL(dd.donor_key, -1) AS donor_key,
-              ISNULL(dc.campaign_key, -1) AS campaign_key,
-              CAST(COALESCE(d.created_at, CONVERT(DATETIME2(0), d.donation_date)) AS DATE) AS created_date,
-              CASE
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) IN (N'confirmed', N'refunded')
-                      THEN d.donation_date
-                  ELSE NULL
-              END AS confirmed_date,
-              af.allocated_date,
-              ISNULL(cd.date_key, -1) AS created_date_key,
-              ISNULL(cfd.date_key, -1) AS confirmed_date_key,
-              ISNULL(ad.date_key, -1) AS allocated_date_key,
-              ISNULL(ds.status_key, -1) AS lifecycle_status_key,
-              CASE
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) = N'refunded' THEN N'refunded'
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) = N'rejected' THEN N'rejected'
-                  WHEN af.allocated_date IS NOT NULL THEN N'allocated'
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) = N'confirmed' THEN N'confirmed'
-                  ELSE N'created'
-              END AS current_stage,
-              d.amount AS donation_amount,
-              CASE
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) IN (N'confirmed', N'refunded')
-                   AND d.donation_date IS NOT NULL
-                   AND COALESCE(d.created_at, CONVERT(DATETIME2(0), d.donation_date)) IS NOT NULL
-                      THEN CASE
-                               WHEN DATEDIFF(DAY, CAST(COALESCE(d.created_at, CONVERT(DATETIME2(0), d.donation_date)) AS DATE), d.donation_date) < 0
-                                   THEN 0
-                               ELSE DATEDIFF(DAY, CAST(COALESCE(d.created_at, CONVERT(DATETIME2(0), d.donation_date)) AS DATE), d.donation_date)
-                           END
-                  ELSE NULL
-              END AS days_to_confirm,
-              CASE
-                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) IN (N'confirmed', N'refunded')
-                   AND d.donation_date IS NOT NULL
-                   AND af.allocated_date IS NOT NULL
-                      THEN CASE
-                               WHEN DATEDIFF(DAY, d.donation_date, af.allocated_date) < 0
-                                   THEN 0
-                               ELSE DATEDIFF(DAY, d.donation_date, af.allocated_date)
-                           END
-                  ELSE NULL
-              END AS days_to_allocate,
-              d.source_system
-        FROM #latest_donation_stg l
-        JOIN Stg_FinanceOps_DB.stg_finance_ops.donations d
-          ON d.stg_row_id = l.max_stg_row_id
-        LEFT JOIN #allocation_first af
-          ON af.source_donation_id = CONVERT(BIGINT, d.id)
-        LEFT JOIN #dim_donor dd
-          ON dd.donor_id = d.donor_id
-        LEFT JOIN #dim_campaign dc
-          ON dc.campaign_id = d.campaign_id
-        LEFT JOIN #dim_date cd
-          ON cd.date_value = CAST(COALESCE(d.created_at, CONVERT(DATETIME2(0), d.donation_date)) AS DATE)
-        LEFT JOIN #dim_date cfd
-          ON cfd.date_value = CASE
-                                  WHEN LOWER(LTRIM(RTRIM(ISNULL(d.status, N'')))) IN (N'confirmed', N'refunded')
-                                      THEN d.donation_date
-                                  ELSE NULL
-                              END
-        LEFT JOIN #dim_date ad
-          ON ad.date_value = af.allocated_date
-        LEFT JOIN #dim_status ds
-          ON ds.status_code = LOWER(LTRIM(RTRIM(ISNULL(d.status, N''))));
+            d.donor_key,
+            d.campaign_key,
+            d.date_key AS created_date_key,
+            CASE WHEN d.is_confirmed=1 THEN d.date_key ELSE -1 END AS confirmed_date_key,
+            ISNULL(alloc.allocated_date_key, -1) AS allocated_date_key,
+            CASE
+                WHEN ISNULL(d.is_refunded,0)=1 THEN ISNULL(st_ref.status_key, -1)
+                WHEN alloc.allocated_date_key IS NOT NULL THEN ISNULL(st_conf.status_key, -1)
+                WHEN d.is_confirmed=1 THEN ISNULL(st_conf.status_key, -1)
+                ELSE ISNULL(st_pending.status_key, -1)
+            END AS lifecycle_status_key,
+            CASE
+                WHEN ISNULL(d.is_refunded,0)=1 THEN N'refunded'
+                WHEN alloc.allocated_date_key IS NOT NULL THEN N'allocated'
+                WHEN d.is_confirmed=1 THEN N'confirmed'
+                ELSE N'created'
+            END AS current_stage,
+            d.amount,
+            CASE WHEN d.is_confirmed=1 AND d.date_key > 0 THEN DATEDIFF(DAY, CONVERT(DATE, CONVERT(CHAR(8), d.date_key)), CONVERT(DATE, CONVERT(CHAR(8), d.date_key))) ELSE NULL END,
+            CASE WHEN d.is_confirmed=1 AND alloc.allocated_date_key IS NOT NULL THEN DATEDIFF(DAY, CONVERT(DATE, CONVERT(CHAR(8), d.date_key)), CONVERT(DATE, CONVERT(CHAR(8), alloc.allocated_date_key))) ELSE NULL END,
+            d.source_donation_id, d.source_donor_id, d.source_campaign_id, d.source_system, @etl_batch_id, SYSDATETIME()
+        FROM dw.fact_donation_transaction d
+        OUTER APPLY (
+            SELECT MIN(a.date_key) AS allocated_date_key
+            FROM dw.fact_budget_allocation_event a
+            WHERE LOWER(ISNULL(a.source_type,N''))=N'donation'
+              AND a.source_id = d.source_donation_id
+        ) alloc
+        LEFT JOIN dw.dim_status st_conf ON st_conf.status_type=N'donation' AND st_conf.code=N'confirmed'
+        LEFT JOIN dw.dim_status st_pending ON st_pending.status_type=N'donation' AND st_pending.code=N'pending'
+        LEFT JOIN dw.dim_status st_ref ON st_ref.status_type=N'donation' AND st_ref.code=N'refunded'
+        WHERE d.date_key BETWEEN CONVERT(INT, CONVERT(CHAR(8), CONVERT(DATE,@start_time), 112)) AND CONVERT(INT, CONVERT(CHAR(8), DATEADD(DAY,-1,CONVERT(DATE,@end_time)), 112));
 
-        SET @rows_work_inserted = @@ROWCOUNT;
+        INSERT INTO etl_work.tmp_fact_donation_lifecycle_final
+        (donor_key, campaign_key, created_date_key, confirmed_date_key, allocated_date_key, lifecycle_status_key,
+         current_stage, donation_amount, days_to_confirm, days_to_allocate, source_donation_id, source_donor_id, source_campaign_id, source_system, etl_batch_id, loaded_at)
+        SELECT o.donor_key, o.campaign_key, o.created_date_key, o.confirmed_date_key, o.allocated_date_key, o.lifecycle_status_key,
+               o.current_stage, o.donation_amount, o.days_to_confirm, o.days_to_allocate, o.source_donation_id, o.source_donor_id, o.source_campaign_id, o.source_system, o.etl_batch_id, o.loaded_at
+        FROM etl_work.tmp_fact_donation_lifecycle_old o
+        WHERE NOT EXISTS (SELECT 1 FROM etl_work.tmp_fact_donation_lifecycle_current c WHERE c.source_donation_id = o.source_donation_id)
+        UNION ALL
+        SELECT c.donor_key, c.campaign_key, c.created_date_key, c.confirmed_date_key, c.allocated_date_key, c.lifecycle_status_key,
+               c.current_stage, c.donation_amount, c.days_to_confirm, c.days_to_allocate, c.source_donation_id, c.source_donor_id, c.source_campaign_id, c.source_system, c.etl_batch_id, c.loaded_at
+        FROM etl_work.tmp_fact_donation_lifecycle_current c;
 
-        SELECT @rows_rejected = COUNT(*)
-        FROM #affected_donation a
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM #work_lifecycle w
-            WHERE w.source_donation_id = a.source_donation_id
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'donations/budget_allocations',
-             N'tempdb', N'#', N'#work_lifecycle',
-             N'succeeded', @rows_loop_total, @rows_work_inserted,
-             0, @rows_rejected,
-             @step_started_at, SYSDATETIME(),
-             N'Built complete lifecycle work table for affected donations. Rejected means affected id had no valid latest donation row.');
-
-        /*---------------------------------------------------------------------
-          Full load table reset and insert.
-        ---------------------------------------------------------------------*/
-        SET @step_started_at = SYSDATETIME();
-
+        SELECT @rows_read=COUNT(*) FROM etl_work.tmp_fact_donation_lifecycle_current;
         BEGIN TRANSACTION;
-
             TRUNCATE TABLE dw.fact_donation_lifecycle;
-            SET @rows_deleted = @@ROWCOUNT;
-
-            DBCC CHECKIDENT (N'dw.fact_donation_lifecycle', RESEED, 0) WITH NO_INFOMSGS;
-
-        COMMIT TRANSACTION;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'dw', N'fact_donation_lifecycle',
-             N'Charity_DW_DB', N'dw', N'fact_donation_lifecycle',
-             N'succeeded', 0, 0,
-             0, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Truncated fact table and reset identity seed to 0 for first load.');
-
-        SET @step_started_at = SYSDATETIME();
-
-        BEGIN TRANSACTION;
-
+            DBCC CHECKIDENT ('dw.fact_donation_lifecycle', RESEED, -1);
             INSERT INTO dw.fact_donation_lifecycle
-            (
-                  donor_key, campaign_key,
-                  created_date_key, confirmed_date_key, allocated_date_key,
-                  lifecycle_status_key, current_stage, donation_amount,
-                  days_to_confirm, days_to_allocate,
-                  source_donation_id, source_donor_id, source_campaign_id,
-                  source_system, etl_batch_id, loaded_at
-            )
-            SELECT
-                  donor_key,
-                  campaign_key,
-                  created_date_key,
-                  confirmed_date_key,
-                  allocated_date_key,
-                  lifecycle_status_key,
-                  current_stage,
-                  donation_amount,
-                  days_to_confirm,
-                  days_to_allocate,
-                  source_donation_id,
-                  source_donor_id,
-                  source_campaign_id,
-                  ISNULL(source_system, N'FINANCE_OPS'),
-                  @etl_batch_id,
-                  SYSDATETIME()
-            FROM #work_lifecycle;
-
-            SET @rows_fact_inserted = @@ROWCOUNT;
-
-        COMMIT TRANSACTION;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'tempdb', N'#', N'#work_lifecycle',
-             N'Charity_DW_DB', N'dw', N'fact_donation_lifecycle',
-             N'succeeded', @rows_work_inserted, @rows_fact_inserted,
-             0, 0,
-             @step_started_at, SYSDATETIME(),
-             N'Inserted lifecycle rows into dw.fact_donation_lifecycle.');
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-        SET load_status = N'succeeded',
-            rows_read = @rows_loop_total,
-            rows_inserted = @rows_fact_inserted,
-            rows_rejected = @rows_rejected,
-            ended_at = SYSDATETIME(),
-            message = CONCAT(N'Finished first load for dw.fact_donation_lifecycle. Inserted rows: ', @rows_fact_inserted,
-                             N'. Affected donation ids: ', @rows_loop_total,
-                             N'. Rejected affected ids: ', @rows_rejected, N'.')
-        WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION;
-
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET load_status = N'failed',
-                ended_at = SYSDATETIME(),
-                message = CONCAT(N'First load failed for dw.fact_donation_lifecycle. Error: ', @error_message)
-            WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+            (donor_key, campaign_key, created_date_key, confirmed_date_key, allocated_date_key, lifecycle_status_key,
+             current_stage, donation_amount, days_to_confirm, days_to_allocate, source_donation_id, source_donor_id, source_campaign_id, source_system, etl_batch_id, loaded_at)
+            SELECT donor_key, campaign_key, created_date_key, confirmed_date_key, allocated_date_key, lifecycle_status_key,
+                   current_stage, donation_amount, days_to_confirm, days_to_allocate, source_donation_id, source_donor_id, source_campaign_id, source_system, etl_batch_id, loaded_at
+            FROM etl_work.tmp_fact_donation_lifecycle_final;
+            SET @rows_inserted=@@ROWCOUNT;
+        COMMIT;
+        EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'dw_fact_lifecycle_inputs', N'fact_donation_lifecycle', N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL, N'Lifecycle fact rebuilt by old fact + newly calculated rows. No UPDATE statement used.';
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, 0, 0, NULL;
+    END TRY BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        DECLARE @error_message NVARCHAR(MAX)=ERROR_MESSAGE();
+        EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, 0, 0, @error_message;
+        ;THROW;
+    END CATCH
+END
 GO
 
 
-/*
-===============================================================================
- Project      : Charity Data Warehouse Project
- Phase        : MART 2 - Finance DW ETL Orchestration
- File         : 25_create_dw_finance_mart2_orchestration_procedures.sql
- DBMS         : Microsoft SQL Server
-
- Purpose:
-   Create two orchestration procedures that execute all Finance MART 2
-   dimension and fact ETL procedures in the correct dependency order.
-
- Procedures:
-   1. etl_admin.usp_first_load_dw_finance_mart2_all
-      - One-time first/full load.
-      - Optionally runs source-to-staging Finance ETL first.
-      - Runs all DW first-load procedures in dependency order.
-
-   2. etl_admin.usp_load_dw_finance_mart2_daily
-      - Normal/daily job procedure.
-      - Optionally runs source-to-staging Finance ETL first.
-      - Runs all DW incremental procedures in dependency order.
-
- Dependency order:
-   Optional staging refresh
-   1. dim_donor
-   2. dim_campaign
-   3. dim_category
-   4. dim_donation_type
-   5. dim_status
-   6. dim_currency
-   7. dim_allocation_type
-   8. fact_donation_transaction
-   9. fact_budget_allocation_event
-  10. fact_monthly_financial_snapshot
-  11. fact_donation_lifecycle
-
- Design rules:
-   - Each procedure accepts @start_time and @end_time.
-   - Period is half-open: [@start_time, @end_time).
-   - Each orchestration step is logged in:
-       Charity_DW_DB.etl_admin.etl_load_log
-   - The master orchestration batch is logged in:
-       Charity_DW_DB.etl_admin.etl_batch
-   - Child procedures also create their own detailed logs.
-   - No MERGE.
-   - No window functions.
-   - No single long transaction around the whole pipeline; each child procedure
-     manages its own transaction. This is safer for practical daily jobs.
-   - Identity/sequence reset is handled inside each child first-load/incremental
-     procedure, according to the table it loads.
-===============================================================================
-*/
-
-
-USE Charity_DW_DB;
-GO
-
-/*=============================================================================
-  Procedure 1: One-Time First Load for Finance MART 2
-=============================================================================*/
 CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_finance_mart2_all
       @start_time  DATETIME2(0),
       @end_time    DATETIME2(0),
@@ -7840,281 +1008,2160 @@ CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_finance_mart2_all
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;
+    EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
 
-    DECLARE
-          @etl_batch_id INT,
-          @main_log_id BIGINT,
-          @step_log_id BIGINT,
-          @step_started_at DATETIME2(0),
-          @step_id INT,
-          @max_step_id INT,
-          @step_name NVARCHAR(200),
-          @procedure_name SYSNAME,
-          @database_name SYSNAME,
-          @parameter_style NVARCHAR(30),
-          @sql NVARCHAR(MAX),
-          @rows_steps_inserted INT = 0,
-          @error_message NVARCHAR(MAX);
-
-    IF @start_time IS NULL OR @end_time IS NULL
+    IF @run_staging = 1
     BEGIN
-        RAISERROR('@start_time and @end_time are required.', 16, 1);
-        RETURN;
-    END;
+        EXEC Stg_FinanceOps_DB.etl_admin.usp_run_stg_finance_ops_all @to_date=@end_time, @etl_batch_id=NULL;
+    END
 
-    IF @start_time >= @end_time
-    BEGIN
-        RAISERROR('@start_time must be earlier than @end_time.', 16, 1);
-        RETURN;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
-    BEGIN
-        RAISERROR('Required table Charity_DW_DB.etl_admin.etl_batch does not exist.', 16, 1);
-        RETURN;
-    END;
-
-    IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
-    BEGIN
-        RAISERROR('Required table Charity_DW_DB.etl_admin.etl_load_log does not exist.', 16, 1);
-        RETURN;
-    END;
-
-    BEGIN TRY
-        INSERT INTO Charity_DW_DB.etl_admin.etl_batch
-            (source_system, target_layer, batch_status, started_at, rows_read, rows_inserted, rows_updated, rows_rejected, created_by)
-        VALUES
-            (N'FINANCE_OPS', N'DW_MART2_FIRST_LOAD_ORCHESTRATION', N'running', SYSDATETIME(), 0, 0, 0, 0, COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL'));
-
-        SET @etl_batch_id = SCOPE_IDENTITY();
-
-        SET @step_started_at = SYSDATETIME();
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Stg_FinanceOps_DB', N'stg_finance_ops', N'orchestration',
-             N'Charity_DW_DB', N'etl_admin', N'usp_first_load_dw_finance_mart2_all',
-             N'running', 0, 0,
-             0, 0,
-             @step_started_at, NULL,
-             CONCAT(N'Finance MART 2 first-load orchestration started. Period: ',
-                    CONVERT(NVARCHAR(30), @start_time, 126), N' to ',
-                    CONVERT(NVARCHAR(30), @end_time, 126),
-                    N'. run_staging=', CONVERT(NVARCHAR(10), @run_staging), N'.'));
-
-        SET @main_log_id = SCOPE_IDENTITY();
-
-        CREATE TABLE #JobSteps
-        (
-              step_id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-              step_name NVARCHAR(200) NOT NULL,
-              database_name SYSNAME NOT NULL,
-              procedure_name SYSNAME NOT NULL,
-              parameter_style NVARCHAR(30) NOT NULL
-        );
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'tempdb', N'#JobSteps',
-             N'Charity_DW_DB', N'etl_admin', N'usp_first_load_dw_finance_mart2_all',
-             N'succeeded', 0, 1,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(),
-             N'Temp table #JobSteps created for first-load orchestration.');
-
-        IF @run_staging = 1
-        BEGIN
-            INSERT INTO #JobSteps (step_name, database_name, procedure_name, parameter_style)
-            VALUES
-                (N'00 - Refresh source Finance data into staging up to @end_time',
-                 N'Stg_FinanceOps_DB', N'usp_run_stg_finance_ops_all', N'to_date');
-        END;
-
-        INSERT INTO #JobSteps (step_name, database_name, procedure_name, parameter_style)
-        VALUES
-            (N'01 - First load dw.dim_donor',                  N'Charity_DW_DB', N'usp_first_load_dw_dim_donor', N'start_end'),
-            (N'02 - First load dw.dim_campaign',               N'Charity_DW_DB', N'usp_first_load_dw_dim_campaign', N'start_end'),
-            (N'03 - First load dw.dim_category',               N'Charity_DW_DB', N'usp_first_load_dw_dim_category', N'start_end'),
-            (N'04 - First load dw.dim_donation_type',          N'Charity_DW_DB', N'usp_first_load_dw_dim_donation_type', N'start_end'),
-            (N'05 - First load dw.dim_status',                 N'Charity_DW_DB', N'usp_first_load_dw_dim_status', N'start_end'),
-            (N'06 - First load dw.dim_currency',               N'Charity_DW_DB', N'usp_first_load_dw_dim_currency', N'start_end'),
-            (N'07 - First load dw.dim_allocation_type',        N'Charity_DW_DB', N'usp_first_load_dw_dim_allocation_type', N'start_end'),
-            (N'08 - First load dw.fact_donation_transaction',  N'Charity_DW_DB', N'usp_first_load_dw_fact_donation_transaction', N'start_end'),
-            (N'09 - First load dw.fact_budget_allocation_event', N'Charity_DW_DB', N'usp_first_load_dw_fact_budget_allocation_event', N'start_end'),
-            (N'10 - First load dw.fact_monthly_financial_snapshot', N'Charity_DW_DB', N'usp_first_load_dw_fact_monthly_financial_snapshot', N'start_end'),
-            (N'11 - First load dw.fact_donation_lifecycle',    N'Charity_DW_DB', N'usp_first_load_dw_fact_donation_lifecycle', N'start_end');
-
-        SET @rows_steps_inserted = @@ROWCOUNT + CASE WHEN @run_staging = 1 THEN 1 ELSE 0 END;
-
-        INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-            (etl_batch_id, source_database, source_schema, source_table,
-             target_database, target_schema, target_table,
-             load_status,
-             rows_read, rows_inserted, rows_updated, rows_rejected,
-             started_at, ended_at, message)
-        VALUES
-            (@etl_batch_id, N'Charity_DW_DB', N'tempdb', N'#JobSteps',
-             N'Charity_DW_DB', N'etl_admin', N'usp_first_load_dw_finance_mart2_all',
-             N'succeeded', 0, @rows_steps_inserted,
-             0, 0,
-             SYSDATETIME(), SYSDATETIME(),
-             N'Execution steps inserted into #JobSteps in dependency order.');
-
-        SELECT @step_id = MIN(step_id), @max_step_id = MAX(step_id)
-        FROM #JobSteps;
-
-        WHILE @step_id IS NOT NULL AND @step_id <= @max_step_id
-        BEGIN
-            SELECT
-                  @step_name = step_name,
-                  @database_name = database_name,
-                  @procedure_name = procedure_name,
-                  @parameter_style = parameter_style
-            FROM #JobSteps
-            WHERE step_id = @step_id;
-
-            SET @step_started_at = SYSDATETIME();
-
-            INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
-                (etl_batch_id, source_database, source_schema, source_table,
-                 target_database, target_schema, target_table,
-                 load_status,
-                 rows_read, rows_inserted, rows_updated, rows_rejected,
-                 started_at, ended_at, message)
-            VALUES
-                (@etl_batch_id, N'ORCHESTRATOR', N'etl_admin', N'usp_first_load_dw_finance_mart2_all',
-                 @database_name, N'etl_admin', @procedure_name,
-                 N'running', 0, 0,
-                 0, 0,
-                 @step_started_at, NULL,
-                 CONCAT(N'Starting step ', CONVERT(NVARCHAR(20), @step_id), N': ', @step_name));
-
-            SET @step_log_id = SCOPE_IDENTITY();
-
-            IF @parameter_style = N'to_date'
-            BEGIN
-                SET @sql = N'EXEC ' + QUOTENAME(@database_name) + N'.etl_admin.' + QUOTENAME(@procedure_name) +
-                           N' @to_date = @p_end_time;';
-
-                EXEC sys.sp_executesql
-                    @sql,
-                    N'@p_end_time DATETIME2(0)',
-                    @p_end_time = @end_time;
-            END
-            ELSE
-            BEGIN
-                SET @sql = N'EXEC ' + QUOTENAME(@database_name) + N'.etl_admin.' + QUOTENAME(@procedure_name) +
-                           N' @start_time = @p_start_time, @end_time = @p_end_time;';
-
-                EXEC sys.sp_executesql
-                    @sql,
-                    N'@p_start_time DATETIME2(0), @p_end_time DATETIME2(0)',
-                    @p_start_time = @start_time,
-                    @p_end_time = @end_time;
-            END;
-
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET
-                load_status = N'succeeded',
-                rows_read = 1,
-                rows_inserted = 1,
-                rows_rejected = 0,
-                ended_at = SYSDATETIME(),
-                message = CONCAT(N'Succeeded step ', CONVERT(NVARCHAR(20), @step_id), N': ', @step_name)
-            WHERE etl_load_log_id = @step_log_id;
-
-            SET @step_id = @step_id + 1;
-        END;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_load_log
-        SET
-            load_status = N'succeeded',
-            rows_read = @rows_steps_inserted,
-            rows_inserted = @rows_steps_inserted,
-            rows_rejected = 0,
-            ended_at = SYSDATETIME(),
-            message = CONCAT(N'Finance MART 2 first-load orchestration succeeded. Executed steps: ',
-                             CONVERT(NVARCHAR(20), @rows_steps_inserted), N'.')
-        WHERE etl_load_log_id = @main_log_id;
-
-        UPDATE Charity_DW_DB.etl_admin.etl_batch
-           SET batch_status  = N'succeeded',
-               ended_at      = SYSDATETIME(),
-               rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                        FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-               error_message = NULL
-         WHERE etl_batch_id = @etl_batch_id;
-    END TRY
-    BEGIN CATCH
-        SET @error_message = ERROR_MESSAGE();
-
-        IF @step_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET
-                load_status = N'failed',
-                ended_at = SYSDATETIME(),
-                message = CONCAT(N'Failed orchestration step. Error: ', @error_message)
-            WHERE etl_load_log_id = @step_log_id
-              AND load_status = N'running';
-        END;
-
-        IF @main_log_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_load_log
-            SET
-                load_status = N'failed',
-                ended_at = SYSDATETIME(),
-                message = CONCAT(N'Finance MART 2 first-load orchestration failed. Error: ', @error_message)
-            WHERE etl_load_log_id = @main_log_id;
-        END;
-
-        IF @etl_batch_id IS NOT NULL
-        BEGIN
-            UPDATE Charity_DW_DB.etl_admin.etl_batch
-               SET batch_status  = N'failed',
-                   ended_at      = SYSDATETIME(),
-                   rows_read     = ISNULL((SELECT SUM(ISNULL(rows_read, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_inserted = ISNULL((SELECT SUM(ISNULL(rows_inserted, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_updated  = ISNULL((SELECT SUM(ISNULL(rows_updated, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   rows_rejected = ISNULL((SELECT SUM(ISNULL(rows_rejected, 0))
-                                            FROM Charity_DW_DB.etl_admin.etl_load_log
-                                        WHERE etl_load_log_id = @main_log_id), 0),
-                   error_message = @error_message
-             WHERE etl_batch_id = @etl_batch_id;
-        END;
-
-        THROW;
-    END CATCH;
-END;
+    EXEC etl_admin.usp_first_load_dw_dim_donor @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_campaign @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_category @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_donation_type @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_status @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_currency @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_dim_allocation_type @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_donation_transaction @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_expense_transaction @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_payment_transaction @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_budget_allocation_event @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_monthly_financial_snapshot @start_time, @end_time;
+    EXEC etl_admin.usp_first_load_dw_fact_donation_lifecycle @start_time, @end_time;
+END
 GO
 
+-- /*
+-- ===============================================================================
+--  Finance MART 2 ETL - Optimized V4
+
+--  Scope:
+--    - Generated from the prerequisite version that already contains expense and
+--      payment transaction facts.
+--    - Dimension ETL is set-based. No date loop is used for dimensions.
+--    - Transaction/event/lifecycle facts are set-based. No date loop is used.
+--    - Monthly snapshot is the only procedure that uses WHILE, because the grain is
+--      month/center snapshot.
+--    - Monthly snapshot reads DW transaction/event facts, not source/staging facts.
+--    - Date and center are resolved directly by joining dimensions, not by loading
+--      separate lookup temp tables.
+--    - No window functions are used.
+--    - No destructive delete/reload or truncate pattern is used in normal business
+--      procedures. First-load procedures are also written as upsert-style loads to
+--      protect current state during practical testing.
+
+--  Physical partitioning note:
+--    These procedures are partition-friendly: fact loads are filtered by date_key or
+--    month_key ranges. Real SQL Server table partitioning must be created in the DW
+--    table/create script by putting fact tables/indexes on a partition scheme.
+-- ===============================================================================
+-- */
+
+-- USE Charity_DW_DB;
+-- GO
+
+-- SET ANSI_NULLS ON;
+-- GO
+-- SET QUOTED_IDENTIFIER ON;
+-- GO
+
+-- IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl_admin')
+-- BEGIN
+--     EXEC(N'CREATE SCHEMA etl_admin');
+-- END
+-- GO
+
+
+-- /*=============================================================================
+--   Helper: fail early if required DW/Staging structures are missing.
+-- =============================================================================*/
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_assert_finance_mart2_prerequisites
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+
+--     IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_batch', N'U') IS NULL
+--         THROW 70001, 'Missing Charity_DW_DB.etl_admin.etl_batch.', 1;
+
+--     IF OBJECT_ID(N'Charity_DW_DB.etl_admin.etl_load_log', N'U') IS NULL
+--         THROW 70002, 'Missing Charity_DW_DB.etl_admin.etl_load_log.', 1;
+
+--     IF OBJECT_ID(N'Stg_FinanceOps_DB.stg_finance_ops.donors', N'U') IS NULL
+--         THROW 70003, 'Missing staging tables in Stg_FinanceOps_DB.stg_finance_ops.', 1;
+-- END
+-- GO
+
+-- /*=============================================================================
+--   Helper: fact-specific prerequisites.
+--   Kept separate so dimensions can be loaded before MART 1 center/child checks.
+-- =============================================================================*/
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_assert_finance_mart2_fact_prerequisites
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+
+--     EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+
+--     IF COL_LENGTH(N'dw.dim_date', N'TimeKey') IS NULL
+--        OR COL_LENGTH(N'dw.dim_date', N'FullDateAlternateKey') IS NULL
+--         THROW 70004, 'dw.dim_date must have TimeKey and FullDateAlternateKey.', 1;
+
+--     IF OBJECT_ID(N'dw.dim_center', N'U') IS NULL
+--         THROW 70005, 'dw.dim_center is required from MART 1.', 1;
+
+--     IF COL_LENGTH(N'dw.dim_center', N'center_key') IS NULL
+--        OR COL_LENGTH(N'dw.dim_center', N'center_id') IS NULL
+--         THROW 70006, 'dw.dim_center must have center_key and center_id for optimized joins.', 1;
+
+--     IF OBJECT_ID(N'dw.dim_child', N'U') IS NULL
+--         THROW 70007, 'dw.dim_child is required from MART 1.', 1;
+
+--     IF COL_LENGTH(N'dw.dim_child', N'child_key') IS NULL
+--        OR COL_LENGTH(N'dw.dim_child', N'child_id') IS NULL
+--         THROW 70008, 'dw.dim_child must have child_key and child_id for optimized joins.', 1;
+-- END
+-- GO
+
+-- /*=============================================================================
+--   Helper: start one ETL batch.
+-- =============================================================================*/
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_dw_start_batch
+--       @target_layer NVARCHAR(100),
+--       @mart_name    NVARCHAR(100) = N'FINANCE_MART2',
+--       @etl_batch_id INT OUTPUT
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+
+--     INSERT INTO Charity_DW_DB.etl_admin.etl_batch
+--     (
+--           source_system,
+--           target_layer,
+--           mart_name,
+--           batch_status,
+--           started_at,
+--           rows_read,
+--           rows_inserted,
+--           rows_updated,
+--           rows_rejected,
+--           created_by
+--     )
+--     VALUES
+--     (
+--           N'FINANCE_OPS',
+--           @target_layer,
+--           @mart_name,
+--           N'running',
+--           SYSDATETIME(),
+--           0,
+--           0,
+--           0,
+--           0,
+--           COALESCE(SUSER_SNAME(), ORIGINAL_LOGIN(), N'DW_ETL')
+--     );
+
+--     SET @etl_batch_id = CONVERT(INT, SCOPE_IDENTITY());
+-- END
+-- GO
+
+-- /*=============================================================================
+--   Helper: write one ETL step log row.
+-- =============================================================================*/
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_dw_log_step
+--       @etl_batch_id    INT,
+--       @source_table    NVARCHAR(128),
+--       @target_table    NVARCHAR(128),
+--       @load_status     NVARCHAR(50),
+--       @rows_read       INT = 0,
+--       @rows_inserted   INT = 0,
+--       @rows_updated    INT = 0,
+--       @rows_rejected   INT = 0,
+--       @started_at      DATETIME2(0) = NULL,
+--       @message         NVARCHAR(MAX) = NULL
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+
+--     INSERT INTO Charity_DW_DB.etl_admin.etl_load_log
+--     (
+--           etl_batch_id,
+--           source_database,
+--           source_schema,
+--           source_table,
+--           target_database,
+--           target_schema,
+--           target_table,
+--           load_status,
+--           rows_read,
+--           rows_inserted,
+--           rows_updated,
+--           rows_rejected,
+--           started_at,
+--           ended_at,
+--           message
+--     )
+--     VALUES
+--     (
+--           @etl_batch_id,
+--           N'Stg_FinanceOps_DB',
+--           N'stg_finance_ops',
+--           @source_table,
+--           N'Charity_DW_DB',
+--           N'dw',
+--           @target_table,
+--           @load_status,
+--           @rows_read,
+--           @rows_inserted,
+--           @rows_updated,
+--           @rows_rejected,
+--           ISNULL(@started_at, SYSDATETIME()),
+--           SYSDATETIME(),
+--           @message
+--     );
+-- END
+-- GO
+
+-- /*=============================================================================
+--   Helper: finish one ETL batch with explicit business counts.
+-- =============================================================================*/
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_dw_finish_batch
+--       @etl_batch_id    INT,
+--       @batch_status    NVARCHAR(50),
+--       @rows_read       INT = 0,
+--       @rows_inserted   INT = 0,
+--       @rows_updated    INT = 0,
+--       @rows_rejected   INT = 0,
+--       @error_message   NVARCHAR(MAX) = NULL
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+
+--     UPDATE Charity_DW_DB.etl_admin.etl_batch
+--        SET batch_status  = @batch_status,
+--            ended_at       = SYSDATETIME(),
+--            rows_read      = ISNULL(@rows_read, 0),
+--            rows_inserted  = ISNULL(@rows_inserted, 0),
+--            rows_updated   = ISNULL(@rows_updated, 0),
+--            rows_rejected  = ISNULL(@rows_rejected, 0),
+--            error_message  = @error_message
+--      WHERE etl_batch_id = @etl_batch_id;
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_donor
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70101, 'Invalid period for dim_donor.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_donor WHERE donor_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_donor ON;
+--             INSERT INTO dw.dim_donor
+--                 (donor_key, donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+--             VALUES
+--                 (-1, -1, N'Unknown', N'unknown', 0, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_donor OFF;
+--         END
+
+--         SELECT
+--               s.id AS donor_id,
+--               s.full_name,
+--               s.donor_type,
+--               s.is_active,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #src_donor
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.donors s
+--         INNER JOIN
+--         (
+--             SELECT id, MAX(stg_row_id) AS max_stg_row_id
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.donors
+--             WHERE is_valid = 1
+--               AND id IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY id
+--         ) x ON x.max_stg_row_id = s.stg_row_id;
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_donor ON #src_donor(donor_id);
+
+--         SELECT
+--               CASE
+--                   WHEN d.donor_key IS NULL THEN N'INSERT'
+--                   WHEN s.donor_id IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(CONVERT(VARBINARY(32), d.row_hash), 0x00) <> ISNULL(CONVERT(VARBINARY(32), s.row_hash), 0x00)
+--                     OR ISNULL(d.full_name, N'') <> ISNULL(s.full_name, N'')
+--                     OR ISNULL(d.donor_type, N'') <> ISNULL(s.donor_type, N'')
+--                     OR ISNULL(d.is_active, 0) <> ISNULL(s.is_active, 0)
+--                       THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.donor_key,
+--               s.donor_id,
+--               s.full_name,
+--               s.donor_type,
+--               s.is_active,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #work_donor
+--         FROM #src_donor s
+--         FULL JOIN dw.dim_donor d
+--                ON d.donor_id = s.donor_id
+--               AND ISNULL(d.donor_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_donor ON #work_donor(action_code, donor_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.full_name     = w.full_name,
+--                d.donor_type    = w.donor_type,
+--                d.is_active     = w.is_active,
+--                d.source_system = w.source_system,
+--                d.row_hash      = w.row_hash,
+--                d.created_at    = w.created_at,
+--                d.updated_at    = w.updated_at
+--         FROM dw.dim_donor d
+--         INNER JOIN #work_donor w ON w.donor_key = d.donor_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_donor
+--             (donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at)
+--         SELECT donor_id, full_name, donor_type, is_active, source_system, row_hash, created_at, updated_at
+--         FROM #work_donor
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(donor_key) FROM dw.dim_donor WHERE donor_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_donor'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donors', N'dim_donor', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_donor load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donors', N'dim_donor', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_campaign
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70201, 'Invalid period for dim_campaign.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_campaign WHERE campaign_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_campaign ON;
+--             INSERT INTO dw.dim_campaign
+--                 (campaign_key, campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+--             VALUES
+--                 (-1, -1, N'Unknown', N'unknown', NULL, NULL, NULL, N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_campaign OFF;
+--         END
+
+--         SELECT
+--               s.id AS campaign_id,
+--               s.title,
+--               s.status AS campaign_status,
+--               s.target_amount,
+--               s.start_date,
+--               s.end_date,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #src_campaign
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns s
+--         INNER JOIN
+--         (
+--             SELECT id, MAX(stg_row_id) AS max_stg_row_id
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns
+--             WHERE is_valid = 1
+--               AND id IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY id
+--         ) x ON x.max_stg_row_id = s.stg_row_id;
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_campaign ON #src_campaign(campaign_id);
+
+--         SELECT
+--               CASE
+--                   WHEN d.campaign_key IS NULL THEN N'INSERT'
+--                   WHEN s.campaign_id IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(CONVERT(VARBINARY(32), d.row_hash), 0x00) <> ISNULL(CONVERT(VARBINARY(32), s.row_hash), 0x00)
+--                     OR ISNULL(d.title, N'') <> ISNULL(s.title, N'')
+--                     OR ISNULL(d.campaign_status, N'') <> ISNULL(s.campaign_status, N'')
+--                     OR ISNULL(d.target_amount, 0) <> ISNULL(s.target_amount, 0)
+--                     OR ISNULL(d.start_date, '19000101') <> ISNULL(s.start_date, '19000101')
+--                     OR ISNULL(d.end_date, '19000101') <> ISNULL(s.end_date, '19000101')
+--                       THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.campaign_key,
+--               s.campaign_id,
+--               s.title,
+--               s.campaign_status,
+--               s.target_amount,
+--               s.start_date,
+--               s.end_date,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #work_campaign
+--         FROM #src_campaign s
+--         FULL JOIN dw.dim_campaign d
+--                ON d.campaign_id = s.campaign_id
+--               AND ISNULL(d.campaign_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_campaign ON #work_campaign(action_code, campaign_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.title           = w.title,
+--                d.campaign_status = w.campaign_status,
+--                d.target_amount   = w.target_amount,
+--                d.start_date      = w.start_date,
+--                d.end_date        = w.end_date,
+--                d.source_system   = w.source_system,
+--                d.row_hash        = w.row_hash,
+--                d.created_at      = w.created_at,
+--                d.updated_at      = w.updated_at
+--         FROM dw.dim_campaign d
+--         INNER JOIN #work_campaign w ON w.campaign_key = d.campaign_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_campaign
+--             (campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at)
+--         SELECT campaign_id, title, campaign_status, target_amount, start_date, end_date, source_system, row_hash, created_at, updated_at
+--         FROM #work_campaign
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(campaign_key) FROM dw.dim_campaign WHERE campaign_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_campaign'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'campaigns', N'dim_campaign', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_campaign load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'campaigns', N'dim_campaign', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_category
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70301, 'Invalid period for dim_category.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_category WHERE category_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_category ON;
+--             INSERT INTO dw.dim_category
+--                 (category_key, category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+--             VALUES
+--                 (-1, -1, N'Unknown', NULL, NULL, N'unknown', N'FINANCE_OPS', NULL, SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_category OFF;
+--         END
+
+--         SELECT
+--               s.id AS category_id,
+--               s.name AS category_name,
+--               s.parent_id AS parent_category_id,
+--               p.name AS parent_category_name,
+--               CASE WHEN ISNULL(s.is_active, 0) = 1 THEN N'active' ELSE N'inactive' END AS category_status,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #src_category
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories s
+--         INNER JOIN
+--         (
+--             SELECT id, MAX(stg_row_id) AS max_stg_row_id
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories
+--             WHERE is_valid = 1
+--               AND id IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY id
+--         ) x ON x.max_stg_row_id = s.stg_row_id
+--         LEFT JOIN Stg_FinanceOps_DB.stg_finance_ops.expense_categories p
+--                ON p.id = s.parent_id
+--               AND p.is_valid = 1
+--               AND NOT EXISTS
+--                   (
+--                       SELECT 1
+--                       FROM Stg_FinanceOps_DB.stg_finance_ops.expense_categories p2
+--                       WHERE p2.id = p.id
+--                         AND p2.is_valid = 1
+--                         AND p2.stg_row_id > p.stg_row_id
+--                   );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_category ON #src_category(category_id);
+
+--         SELECT
+--               CASE
+--                   WHEN d.category_key IS NULL THEN N'INSERT'
+--                   WHEN s.category_id IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(CONVERT(VARBINARY(32), d.row_hash), 0x00) <> ISNULL(CONVERT(VARBINARY(32), s.row_hash), 0x00)
+--                     OR ISNULL(d.category_name, N'') <> ISNULL(s.category_name, N'')
+--                     OR ISNULL(d.parent_category_id, -999999) <> ISNULL(s.parent_category_id, -999999)
+--                     OR ISNULL(d.parent_category_name, N'') <> ISNULL(s.parent_category_name, N'')
+--                     OR ISNULL(d.category_status, N'') <> ISNULL(s.category_status, N'')
+--                       THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.category_key,
+--               s.category_id,
+--               s.category_name,
+--               s.parent_category_id,
+--               s.parent_category_name,
+--               s.category_status,
+--               s.source_system,
+--               s.row_hash,
+--               s.created_at,
+--               s.updated_at
+--         INTO #work_category
+--         FROM #src_category s
+--         FULL JOIN dw.dim_category d
+--                ON d.category_id = s.category_id
+--               AND ISNULL(d.category_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_category ON #work_category(action_code, category_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.category_name        = w.category_name,
+--                d.parent_category_id   = w.parent_category_id,
+--                d.parent_category_name = w.parent_category_name,
+--                d.category_status      = w.category_status,
+--                d.source_system        = w.source_system,
+--                d.row_hash             = w.row_hash,
+--                d.created_at           = w.created_at,
+--                d.updated_at           = w.updated_at
+--         FROM dw.dim_category d
+--         INNER JOIN #work_category w ON w.category_key = d.category_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_category
+--             (category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at)
+--         SELECT category_id, category_name, parent_category_id, parent_category_name, category_status, source_system, row_hash, created_at, updated_at
+--         FROM #work_category
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(category_key) FROM dw.dim_category WHERE category_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_category'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expense_categories', N'dim_category', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_category load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expense_categories', N'dim_category', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_donation_type
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70401, 'Invalid period for dim_donation_type.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_donation_type WHERE donation_type_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_donation_type ON;
+--             INSERT INTO dw.dim_donation_type (donation_type_key, code, title, source_system, created_at, updated_at)
+--             VALUES (-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_donation_type OFF;
+--         END
+
+--         SELECT
+--               LOWER(LTRIM(RTRIM(s.donation_type))) AS code,
+--               MIN(LTRIM(RTRIM(s.donation_type))) AS title,
+--               N'FINANCE_OPS' AS source_system,
+--               MIN(COALESCE(s.created_at, s.extracted_at)) AS created_at,
+--               MAX(COALESCE(s.updated_at, s.source_updated_at, s.extracted_at)) AS updated_at
+--         INTO #src_donation_type
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.donations s
+--         WHERE s.is_valid = 1
+--           AND NULLIF(LTRIM(RTRIM(s.donation_type)), N'') IS NOT NULL
+--           AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @start_time
+--           AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @end_time
+--         GROUP BY LOWER(LTRIM(RTRIM(s.donation_type)));
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_donation_type ON #src_donation_type(code);
+
+--         SELECT
+--               CASE
+--                   WHEN d.donation_type_key IS NULL THEN N'INSERT'
+--                   WHEN s.code IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(d.title,N'') <> ISNULL(s.title,N'') OR ISNULL(d.source_system,N'') <> ISNULL(s.source_system,N'') THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.donation_type_key,
+--               s.code, s.title, s.source_system, s.created_at, s.updated_at
+--         INTO #work_donation_type
+--         FROM #src_donation_type s
+--         FULL JOIN dw.dim_donation_type d
+--                ON d.code = s.code
+--               AND ISNULL(d.donation_type_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_donation_type ON #work_donation_type(action_code, code);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.title = w.title, d.source_system = w.source_system, d.updated_at = w.updated_at
+--         FROM dw.dim_donation_type d
+--         INNER JOIN #work_donation_type w ON w.donation_type_key = d.donation_type_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_donation_type
+--             (code, title, source_system, created_at, updated_at)
+--         SELECT code, title, source_system, created_at, updated_at
+--         FROM #work_donation_type
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(donation_type_key) FROM dw.dim_donation_type WHERE donation_type_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_donation_type'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'dim_donation_type', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_donation_type load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'dim_donation_type', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_status
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70501, 'Invalid period for dim_status.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_status WHERE status_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_status ON;
+--             INSERT INTO dw.dim_status (status_key, status_type, code, title, category, source_system, created_at, updated_at)
+--             VALUES (-1, N'unknown', N'unknown', N'Unknown', N'unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_status OFF;
+--         END
+
+--         SELECT
+--               status_type,
+--               code,
+--               MIN(title) AS title,
+--               status_type AS category,
+--               N'FINANCE_OPS' AS source_system,
+--               MIN(created_at) AS created_at,
+--               MAX(updated_at) AS updated_at
+--         INTO #src_status
+--         FROM
+--         (
+--             SELECT N'campaign' AS status_type, LOWER(LTRIM(RTRIM(status))) AS code, MIN(LTRIM(RTRIM(status))) AS title,
+--                    MIN(COALESCE(created_at, extracted_at)) AS created_at, MAX(COALESCE(updated_at, source_updated_at, extracted_at)) AS updated_at
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.campaigns
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(status)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY LOWER(LTRIM(RTRIM(status)))
+--             UNION ALL
+--             SELECT N'donation', LOWER(LTRIM(RTRIM(status))), MIN(LTRIM(RTRIM(status))), MIN(COALESCE(created_at, extracted_at)), MAX(COALESCE(updated_at, source_updated_at, extracted_at))
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(status)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY LOWER(LTRIM(RTRIM(status)))
+--             UNION ALL
+--             SELECT N'expense', LOWER(LTRIM(RTRIM(status))), MIN(LTRIM(RTRIM(status))), MIN(COALESCE(created_at, extracted_at)), MAX(COALESCE(updated_at, source_updated_at, extracted_at))
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.expenses
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(status)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY LOWER(LTRIM(RTRIM(status)))
+--             UNION ALL
+--             SELECT N'payment', LOWER(LTRIM(RTRIM(status))), MIN(LTRIM(RTRIM(status))), MIN(COALESCE(created_at, extracted_at)), MAX(COALESCE(updated_at, source_updated_at, extracted_at))
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.payments
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(status)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY LOWER(LTRIM(RTRIM(status)))
+--         ) x
+--         GROUP BY status_type, code;
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_status ON #src_status(status_type, code);
+
+--         SELECT
+--               CASE
+--                   WHEN d.status_key IS NULL THEN N'INSERT'
+--                   WHEN s.code IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(d.title,N'') <> ISNULL(s.title,N'') OR ISNULL(d.category,N'') <> ISNULL(s.category,N'') OR ISNULL(d.source_system,N'') <> ISNULL(s.source_system,N'') THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.status_key,
+--               s.status_type, s.code, s.title, s.category, s.source_system, s.created_at, s.updated_at
+--         INTO #work_status
+--         FROM #src_status s
+--         FULL JOIN dw.dim_status d
+--                ON d.status_type = s.status_type AND d.code = s.code
+--               AND ISNULL(d.status_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_status ON #work_status(action_code, code);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.title = w.title, d.category = w.category, d.source_system = w.source_system, d.updated_at = w.updated_at
+--         FROM dw.dim_status d
+--         INNER JOIN #work_status w ON w.status_key = d.status_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_status
+--             (status_type, code, title, category, source_system, created_at, updated_at)
+--         SELECT status_type, code, title, category, source_system, created_at, updated_at
+--         FROM #work_status
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(status_key) FROM dw.dim_status WHERE status_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_status'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'campaigns/donations/expenses/payments', N'dim_status', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_status load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'campaigns/donations/expenses/payments', N'dim_status', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_currency
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70601, 'Invalid period for dim_currency.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_currency WHERE currency_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_currency ON;
+--             INSERT INTO dw.dim_currency (currency_key, code, name, source_system, created_at, updated_at)
+--             VALUES (-1, N'UNK', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_currency OFF;
+--         END
+
+--         SELECT
+--               code,
+--               CASE code
+--                    WHEN N'IRR' THEN N'Iranian Rial'
+--                    WHEN N'USD' THEN N'US Dollar'
+--                    WHEN N'EUR' THEN N'Euro'
+--                    WHEN N'GBP' THEN N'British Pound'
+--                    ELSE code
+--               END AS name,
+--               N'FINANCE_OPS' AS source_system,
+--               MIN(created_at) AS created_at,
+--               MAX(updated_at) AS updated_at
+--         INTO #src_currency
+--         FROM
+--         (
+--             SELECT UPPER(LTRIM(RTRIM(currency))) AS code, MIN(COALESCE(created_at, extracted_at)) AS created_at, MAX(COALESCE(updated_at, source_updated_at, extracted_at)) AS updated_at
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(currency)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY UPPER(LTRIM(RTRIM(currency)))
+--             UNION ALL
+--             SELECT UPPER(LTRIM(RTRIM(currency))), MIN(COALESCE(created_at, extracted_at)), MAX(COALESCE(updated_at, source_updated_at, extracted_at))
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.expenses
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(currency)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY UPPER(LTRIM(RTRIM(currency)))
+--             UNION ALL
+--             SELECT UPPER(LTRIM(RTRIM(currency))), MIN(COALESCE(created_at, extracted_at)), MAX(COALESCE(updated_at, source_updated_at, extracted_at))
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.payments
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(currency)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, updated_at, created_at, extracted_at) <  @end_time
+--             GROUP BY UPPER(LTRIM(RTRIM(currency)))
+--             UNION ALL
+--             SELECT UPPER(LTRIM(RTRIM(from_currency))), MIN(COALESCE(rate_date, extracted_at)), MAX(extracted_at)
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(from_currency)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, rate_date, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, rate_date, extracted_at) <  @end_time
+--             GROUP BY UPPER(LTRIM(RTRIM(from_currency)))
+--             UNION ALL
+--             SELECT UPPER(LTRIM(RTRIM(to_currency))), MIN(COALESCE(rate_date, extracted_at)), MAX(extracted_at)
+--             FROM Stg_FinanceOps_DB.stg_finance_ops.currency_rates
+--             WHERE is_valid = 1 AND NULLIF(LTRIM(RTRIM(to_currency)), N'') IS NOT NULL
+--               AND COALESCE(source_updated_at, rate_date, extracted_at) >= @start_time
+--               AND COALESCE(source_updated_at, rate_date, extracted_at) <  @end_time
+--             GROUP BY UPPER(LTRIM(RTRIM(to_currency)))
+--         ) x
+--         GROUP BY code;
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_currency ON #src_currency(code);
+
+--         SELECT
+--               CASE
+--                   WHEN d.currency_key IS NULL THEN N'INSERT'
+--                   WHEN s.code IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(d.name,N'') <> ISNULL(s.name,N'') OR ISNULL(d.source_system,N'') <> ISNULL(s.source_system,N'') THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.currency_key,
+--               s.code, s.name, s.source_system, s.created_at, s.updated_at
+--         INTO #work_currency
+--         FROM #src_currency s
+--         FULL JOIN dw.dim_currency d
+--                ON d.code = s.code
+--               AND ISNULL(d.currency_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_currency ON #work_currency(action_code, code);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.name = w.name, d.source_system = w.source_system, d.updated_at = w.updated_at
+--         FROM dw.dim_currency d
+--         INNER JOIN #work_currency w ON w.currency_key = d.currency_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_currency
+--             (code, name, source_system, created_at, updated_at)
+--         SELECT code, name, source_system, created_at, updated_at
+--         FROM #work_currency
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(currency_key) FROM dw.dim_currency WHERE currency_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_currency'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations/expenses/payments/currency_rates', N'dim_currency', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_currency load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations/expenses/payments/currency_rates', N'dim_currency', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_dim_allocation_type
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_DIMENSION', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 70701, 'Invalid period for dim_allocation_type.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         IF NOT EXISTS (SELECT 1 FROM dw.dim_allocation_type WHERE allocation_type_key = -1)
+--         BEGIN
+--             SET IDENTITY_INSERT dw.dim_allocation_type ON;
+--             INSERT INTO dw.dim_allocation_type (allocation_type_key, code, title, source_system, created_at, updated_at)
+--             VALUES (-1, N'unknown', N'Unknown', N'FINANCE_OPS', SYSDATETIME(), NULL);
+--             SET IDENTITY_INSERT dw.dim_allocation_type OFF;
+--         END
+
+--         SELECT
+--               LOWER(LTRIM(RTRIM(source_type))) AS code,
+--               MIN(LTRIM(RTRIM(source_type))) AS title,
+--               N'FINANCE_OPS' AS source_system,
+--               MIN(COALESCE(created_at, extracted_at)) AS created_at,
+--               MAX(COALESCE(source_updated_at, created_at, extracted_at)) AS updated_at
+--         INTO #src_allocation_type
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations
+--         WHERE is_valid = 1
+--           AND NULLIF(LTRIM(RTRIM(source_type)), N'') IS NOT NULL
+--           AND COALESCE(source_updated_at, created_at, allocation_date, extracted_at) >= @start_time
+--           AND COALESCE(source_updated_at, created_at, allocation_date, extracted_at) <  @end_time
+--         GROUP BY LOWER(LTRIM(RTRIM(source_type)));
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_allocation_type ON #src_allocation_type(code);
+
+--         SELECT
+--               CASE
+--                   WHEN d.allocation_type_key IS NULL THEN N'INSERT'
+--                   WHEN s.code IS NULL THEN N'NO_SOURCE'
+--                   WHEN ISNULL(d.title,N'') <> ISNULL(s.title,N'') OR ISNULL(d.source_system,N'') <> ISNULL(s.source_system,N'') THEN N'UPDATE'
+--                   ELSE N'NO_CHANGE'
+--               END AS action_code,
+--               d.allocation_type_key,
+--               s.code, s.title, s.source_system, s.created_at, s.updated_at
+--         INTO #work_allocation_type
+--         FROM #src_allocation_type s
+--         FULL JOIN dw.dim_allocation_type d
+--                ON d.code = s.code
+--               AND ISNULL(d.allocation_type_key, -999999) <> -1;
+
+--         CREATE CLUSTERED INDEX CX_work_allocation_type ON #work_allocation_type(action_code, code);
+
+--         BEGIN TRAN;
+
+--         UPDATE d
+--            SET d.title = w.title, d.source_system = w.source_system, d.updated_at = w.updated_at
+--         FROM dw.dim_allocation_type d
+--         INNER JOIN #work_allocation_type w ON w.allocation_type_key = d.allocation_type_key
+--         WHERE w.action_code = N'UPDATE';
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.dim_allocation_type
+--             (code, title, source_system, created_at, updated_at)
+--         SELECT code, title, source_system, created_at, updated_at
+--         FROM #work_allocation_type
+--         WHERE action_code = N'INSERT';
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key INT = ISNULL((SELECT MAX(allocation_type_key) FROM dw.dim_allocation_type WHERE allocation_type_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.dim_allocation_type'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'dim_allocation_type', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based FULL JOIN dim_allocation_type load.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'dim_allocation_type', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_donation_transaction
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+--     DECLARE @start_key INT = CAST(CONVERT(CHAR(8), CAST(@start_time AS DATE), 112) AS INT);
+--     DECLARE @end_key_exclusive INT = CAST(CONVERT(CHAR(8), CAST(@end_time AS DATE), 112) AS INT);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71001, 'Invalid period for fact_donation_transaction.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         SELECT
+--               ISNULL(dd.TimeKey, -1) AS date_key,
+--               ISNULL(donor.donor_key, -1) AS donor_key,
+--               ISNULL(camp.campaign_key, -1) AS campaign_key,
+--               CONVERT(INT, -1) AS center_key,
+--               ISNULL(dt.donation_type_key, -1) AS donation_type_key,
+--               ISNULL(cur.currency_key, -1) AS currency_key,
+--               ISNULL(st.status_key, -1) AS status_key,
+--               s.amount,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'confirmed', N'paid', N'completed', N'success') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_confirmed,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'refunded') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_refunded,
+--               CONVERT(BIGINT, s.id) AS source_donation_id,
+--               CONVERT(BIGINT, s.donor_id) AS source_donor_id,
+--               CONVERT(BIGINT, s.campaign_id) AS source_campaign_id,
+--               s.reference_code AS source_reference_code,
+--               s.source_system
+--         INTO #src_fact_donation
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.donations s
+--         LEFT JOIN dw.dim_date dd
+--                ON dd.FullDateAlternateKey = CAST(s.donation_date AS DATE)
+--         LEFT JOIN dw.dim_donor donor
+--                ON donor.donor_id = s.donor_id
+--               AND donor.donor_key <> -1
+--         LEFT JOIN dw.dim_campaign camp
+--                ON camp.campaign_id = s.campaign_id
+--               AND camp.campaign_key <> -1
+--         LEFT JOIN dw.dim_donation_type dt
+--                ON dt.code = LOWER(LTRIM(RTRIM(s.donation_type)))
+--               AND dt.donation_type_key <> -1
+--         LEFT JOIN dw.dim_currency cur
+--                ON cur.code = UPPER(LTRIM(RTRIM(s.currency)))
+--               AND cur.currency_key <> -1
+--         LEFT JOIN dw.dim_status st
+--                ON st.status_type = N'donation'
+--               AND st.code = LOWER(LTRIM(RTRIM(s.status)))
+--               AND st.status_key <> -1
+--         WHERE s.is_valid = 1
+--           AND s.id IS NOT NULL
+--           AND (
+--                  (s.donation_date >= CAST(@start_time AS DATE) AND s.donation_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @start_time
+--                   AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @end_time)
+--           )
+--           AND NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM Stg_FinanceOps_DB.stg_finance_ops.donations s2
+--                   WHERE s2.id = s.id
+--                     AND s2.is_valid = 1
+--                     AND s2.stg_row_id > s.stg_row_id
+--               );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_fact_donation ON #src_fact_donation(source_donation_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE f
+--            SET f.date_key              = s.date_key,
+--                f.donor_key             = s.donor_key,
+--                f.campaign_key          = s.campaign_key,
+--                f.center_key            = s.center_key,
+--                f.donation_type_key     = s.donation_type_key,
+--                f.currency_key          = s.currency_key,
+--                f.status_key            = s.status_key,
+--                f.amount                = s.amount,
+--                f.is_confirmed          = s.is_confirmed,
+--                f.is_refunded           = s.is_refunded,
+--                f.source_donor_id       = s.source_donor_id,
+--                f.source_campaign_id    = s.source_campaign_id,
+--                f.source_reference_code = s.source_reference_code,
+--                f.source_system         = s.source_system,
+--                f.etl_batch_id          = @etl_batch_id,
+--                f.loaded_at             = SYSDATETIME()
+--         FROM dw.fact_donation_transaction f
+--         INNER JOIN #src_fact_donation s
+--                 ON s.source_donation_id = f.source_donation_id
+--         WHERE ISNULL(f.date_key, -1) BETWEEN @start_key AND 99991231
+--           AND (
+--                  ISNULL(f.date_key, -1) <> ISNULL(s.date_key, -1)
+--               OR ISNULL(f.donor_key, -1) <> ISNULL(s.donor_key, -1)
+--               OR ISNULL(f.campaign_key, -1) <> ISNULL(s.campaign_key, -1)
+--               OR ISNULL(f.donation_type_key, -1) <> ISNULL(s.donation_type_key, -1)
+--               OR ISNULL(f.currency_key, -1) <> ISNULL(s.currency_key, -1)
+--               OR ISNULL(f.status_key, -1) <> ISNULL(s.status_key, -1)
+--               OR ISNULL(f.amount, 0) <> ISNULL(s.amount, 0)
+--               OR ISNULL(f.is_confirmed, 0) <> ISNULL(s.is_confirmed, 0)
+--               OR ISNULL(f.is_refunded, 0) <> ISNULL(s.is_refunded, 0)
+--               OR ISNULL(f.source_reference_code, N'') <> ISNULL(s.source_reference_code, N'')
+--           );
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.fact_donation_transaction
+--         (
+--               date_key, donor_key, campaign_key, center_key, donation_type_key, currency_key, status_key,
+--               amount, is_confirmed, is_refunded, source_donation_id, source_donor_id, source_campaign_id,
+--               source_reference_code, source_system, etl_batch_id, loaded_at
+--         )
+--         SELECT
+--               s.date_key, s.donor_key, s.campaign_key, s.center_key, s.donation_type_key, s.currency_key, s.status_key,
+--               s.amount, s.is_confirmed, s.is_refunded, s.source_donation_id, s.source_donor_id, s.source_campaign_id,
+--               s.source_reference_code, s.source_system, @etl_batch_id, SYSDATETIME()
+--         FROM #src_fact_donation s
+--         WHERE NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM dw.fact_donation_transaction f
+--                   WHERE f.source_donation_id = s.source_donation_id
+--               );
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(donation_transaction_key) FROM dw.fact_donation_transaction WHERE donation_transaction_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_donation_transaction'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'fact_donation_transaction', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based upsert fact_donation_transaction.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations', N'fact_donation_transaction', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_expense_transaction
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+--     DECLARE @start_key INT = CAST(CONVERT(CHAR(8), CAST(@start_time AS DATE), 112) AS INT);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71101, 'Invalid period for fact_expense_transaction.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         SELECT
+--               ISNULL(dd.TimeKey, -1) AS date_key,
+--               ISNULL(dc.center_key, -1) AS center_key,
+--               ISNULL(ch.child_key, -1) AS child_key,
+--               ISNULL(cat.category_key, -1) AS category_key,
+--               ISNULL(cur.currency_key, -1) AS currency_key,
+--               ISNULL(st.status_key, -1) AS status_key,
+--               s.amount,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'approved', N'paid', N'completed') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_approved,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'rejected', N'cancelled') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_rejected,
+--               s.description,
+--               CONVERT(BIGINT, s.id) AS source_expense_id,
+--               CONVERT(BIGINT, s.center_id) AS source_center_id,
+--               CONVERT(BIGINT, s.child_id) AS source_child_id,
+--               CONVERT(BIGINT, s.category_id) AS source_category_id,
+--               s.source_system
+--         INTO #src_fact_expense
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.expenses s
+--         LEFT JOIN dw.dim_date dd
+--                ON dd.FullDateAlternateKey = CAST(s.expense_date AS DATE)
+--         LEFT JOIN dw.dim_center dc
+--                ON dc.center_id = CONVERT(BIGINT, s.center_id)
+--               AND dc.center_key <> -1
+--         LEFT JOIN dw.dim_child ch
+--                ON ch.child_id = CONVERT(BIGINT, s.child_id)
+--               AND ch.child_key <> -1
+--         LEFT JOIN dw.dim_category cat
+--                ON cat.category_id = s.category_id
+--               AND cat.category_key <> -1
+--         LEFT JOIN dw.dim_currency cur
+--                ON cur.code = UPPER(LTRIM(RTRIM(s.currency)))
+--               AND cur.currency_key <> -1
+--         LEFT JOIN dw.dim_status st
+--                ON st.status_type = N'expense'
+--               AND st.code = LOWER(LTRIM(RTRIM(s.status)))
+--               AND st.status_key <> -1
+--         WHERE s.is_valid = 1
+--           AND s.id IS NOT NULL
+--           AND (
+--                  (s.expense_date >= CAST(@start_time AS DATE) AND s.expense_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @start_time
+--                   AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @end_time)
+--           )
+--           AND NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM Stg_FinanceOps_DB.stg_finance_ops.expenses s2
+--                   WHERE s2.id = s.id
+--                     AND s2.is_valid = 1
+--                     AND s2.stg_row_id > s.stg_row_id
+--               );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_fact_expense ON #src_fact_expense(source_expense_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE f
+--            SET f.date_key           = s.date_key,
+--                f.center_key         = s.center_key,
+--                f.child_key          = s.child_key,
+--                f.category_key       = s.category_key,
+--                f.currency_key       = s.currency_key,
+--                f.status_key         = s.status_key,
+--                f.amount             = s.amount,
+--                f.is_approved        = s.is_approved,
+--                f.is_rejected        = s.is_rejected,
+--                f.description        = s.description,
+--                f.source_center_id   = s.source_center_id,
+--                f.source_child_id    = s.source_child_id,
+--                f.source_category_id = s.source_category_id,
+--                f.source_system      = s.source_system,
+--                f.etl_batch_id       = @etl_batch_id,
+--                f.loaded_at          = SYSDATETIME()
+--         FROM dw.fact_expense_transaction f
+--         INNER JOIN #src_fact_expense s
+--                 ON s.source_expense_id = f.source_expense_id
+--         WHERE ISNULL(f.date_key, -1) BETWEEN @start_key AND 99991231
+--           AND (
+--                  ISNULL(f.date_key, -1) <> ISNULL(s.date_key, -1)
+--               OR ISNULL(f.center_key, -1) <> ISNULL(s.center_key, -1)
+--               OR ISNULL(f.child_key, -1) <> ISNULL(s.child_key, -1)
+--               OR ISNULL(f.category_key, -1) <> ISNULL(s.category_key, -1)
+--               OR ISNULL(f.currency_key, -1) <> ISNULL(s.currency_key, -1)
+--               OR ISNULL(f.status_key, -1) <> ISNULL(s.status_key, -1)
+--               OR ISNULL(f.amount, 0) <> ISNULL(s.amount, 0)
+--               OR ISNULL(f.is_approved, 0) <> ISNULL(s.is_approved, 0)
+--               OR ISNULL(f.is_rejected, 0) <> ISNULL(s.is_rejected, 0)
+--               OR ISNULL(f.description, N'') <> ISNULL(s.description, N'')
+--           );
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.fact_expense_transaction
+--         (
+--               date_key, center_key, child_key, category_key, currency_key, status_key,
+--               amount, is_approved, is_rejected, description, source_expense_id, source_center_id,
+--               source_child_id, source_category_id, source_system, etl_batch_id, loaded_at
+--         )
+--         SELECT
+--               s.date_key, s.center_key, s.child_key, s.category_key, s.currency_key, s.status_key,
+--               s.amount, s.is_approved, s.is_rejected, s.description, s.source_expense_id, s.source_center_id,
+--               s.source_child_id, s.source_category_id, s.source_system, @etl_batch_id, SYSDATETIME()
+--         FROM #src_fact_expense s
+--         WHERE NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM dw.fact_expense_transaction f
+--                   WHERE f.source_expense_id = s.source_expense_id
+--               );
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(expense_transaction_key) FROM dw.fact_expense_transaction WHERE expense_transaction_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_expense_transaction'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expenses', N'fact_expense_transaction', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based upsert fact_expense_transaction.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'expenses', N'fact_expense_transaction', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_payment_transaction
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+--     DECLARE @start_key INT = CAST(CONVERT(CHAR(8), CAST(@start_time AS DATE), 112) AS INT);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71201, 'Invalid period for fact_payment_transaction.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         SELECT
+--               ISNULL(dd.TimeKey, -1) AS date_key,
+--               ISNULL(dc.center_key, -1) AS center_key,
+--               ISNULL(cur.currency_key, -1) AS currency_key,
+--               ISNULL(st.status_key, -1) AS status_key,
+--               s.payment_type,
+--               CONVERT(BIGINT, s.teacher_id) AS source_teacher_id,
+--               s.amount,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'paid', N'completed', N'success') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_paid,
+--               CASE WHEN LOWER(ISNULL(s.status, N'')) IN (N'cancelled', N'rejected') THEN CONVERT(BIT,1) ELSE CONVERT(BIT,0) END AS is_cancelled,
+--               CONVERT(BIGINT, s.id) AS source_payment_id,
+--               CONVERT(BIGINT, s.center_id) AS source_center_id,
+--               s.source_system
+--         INTO #src_fact_payment
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.payments s
+--         LEFT JOIN dw.dim_date dd
+--                ON dd.FullDateAlternateKey = CAST(s.payment_date AS DATE)
+--         LEFT JOIN dw.dim_center dc
+--                ON dc.center_id = CONVERT(BIGINT, s.center_id)
+--               AND dc.center_key <> -1
+--         LEFT JOIN dw.dim_currency cur
+--                ON cur.code = UPPER(LTRIM(RTRIM(s.currency)))
+--               AND cur.currency_key <> -1
+--         LEFT JOIN dw.dim_status st
+--                ON st.status_type = N'payment'
+--               AND st.code = LOWER(LTRIM(RTRIM(s.status)))
+--               AND st.status_key <> -1
+--         WHERE s.is_valid = 1
+--           AND s.id IS NOT NULL
+--           AND (
+--                  (s.payment_date >= CAST(@start_time AS DATE) AND s.payment_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) >= @start_time
+--                   AND COALESCE(s.source_updated_at, s.updated_at, s.created_at, s.extracted_at) <  @end_time)
+--           )
+--           AND NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM Stg_FinanceOps_DB.stg_finance_ops.payments s2
+--                   WHERE s2.id = s.id
+--                     AND s2.is_valid = 1
+--                     AND s2.stg_row_id > s.stg_row_id
+--               );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_fact_payment ON #src_fact_payment(source_payment_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE f
+--            SET f.date_key          = s.date_key,
+--                f.center_key        = s.center_key,
+--                f.currency_key      = s.currency_key,
+--                f.status_key        = s.status_key,
+--                f.payment_type      = s.payment_type,
+--                f.source_teacher_id = s.source_teacher_id,
+--                f.amount            = s.amount,
+--                f.is_paid           = s.is_paid,
+--                f.is_cancelled      = s.is_cancelled,
+--                f.source_center_id  = s.source_center_id,
+--                f.source_system     = s.source_system,
+--                f.etl_batch_id      = @etl_batch_id,
+--                f.loaded_at         = SYSDATETIME()
+--         FROM dw.fact_payment_transaction f
+--         INNER JOIN #src_fact_payment s
+--                 ON s.source_payment_id = f.source_payment_id
+--         WHERE ISNULL(f.date_key, -1) BETWEEN @start_key AND 99991231
+--           AND (
+--                  ISNULL(f.date_key, -1) <> ISNULL(s.date_key, -1)
+--               OR ISNULL(f.center_key, -1) <> ISNULL(s.center_key, -1)
+--               OR ISNULL(f.currency_key, -1) <> ISNULL(s.currency_key, -1)
+--               OR ISNULL(f.status_key, -1) <> ISNULL(s.status_key, -1)
+--               OR ISNULL(f.payment_type, N'') <> ISNULL(s.payment_type, N'')
+--               OR ISNULL(f.source_teacher_id, -1) <> ISNULL(s.source_teacher_id, -1)
+--               OR ISNULL(f.amount, 0) <> ISNULL(s.amount, 0)
+--               OR ISNULL(f.is_paid, 0) <> ISNULL(s.is_paid, 0)
+--               OR ISNULL(f.is_cancelled, 0) <> ISNULL(s.is_cancelled, 0)
+--           );
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.fact_payment_transaction
+--         (
+--               date_key, center_key, currency_key, status_key, payment_type, source_teacher_id,
+--               amount, is_paid, is_cancelled, source_payment_id, source_center_id,
+--               source_system, etl_batch_id, loaded_at
+--         )
+--         SELECT
+--               s.date_key, s.center_key, s.currency_key, s.status_key, s.payment_type, s.source_teacher_id,
+--               s.amount, s.is_paid, s.is_cancelled, s.source_payment_id, s.source_center_id,
+--               s.source_system, @etl_batch_id, SYSDATETIME()
+--         FROM #src_fact_payment s
+--         WHERE NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM dw.fact_payment_transaction f
+--                   WHERE f.source_payment_id = s.source_payment_id
+--               );
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(payment_transaction_key) FROM dw.fact_payment_transaction WHERE payment_transaction_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_payment_transaction'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'payments', N'fact_payment_transaction', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based upsert fact_payment_transaction.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'payments', N'fact_payment_transaction', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_budget_allocation_event
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+--     DECLARE @start_key INT = CAST(CONVERT(CHAR(8), CAST(@start_time AS DATE), 112) AS INT);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71301, 'Invalid period for fact_budget_allocation_event.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         SELECT
+--               ISNULL(dd.TimeKey, -1) AS date_key,
+--               CASE WHEN LOWER(ISNULL(s.source_type,N'')) = N'donation' THEN ISNULL(donor.donor_key, -1) ELSE -1 END AS donor_key,
+--               ISNULL(dc.center_key, -1) AS center_key,
+--               ISNULL(ch.child_key, -1) AS child_key,
+--               ISNULL(cat.category_key, -1) AS category_key,
+--               CASE WHEN LOWER(ISNULL(s.source_type,N'')) = N'donation' THEN ISNULL(camp.campaign_key, -1) ELSE -1 END AS campaign_key,
+--               ISNULL(at.allocation_type_key, -1) AS allocation_type_key,
+--               s.allocated_amount,
+--               s.reason,
+--               CONVERT(BIGINT, s.id) AS source_allocation_id,
+--               s.source_type,
+--               CONVERT(BIGINT, s.source_id) AS source_id,
+--               CONVERT(BIGINT, s.center_id) AS source_center_id,
+--               CONVERT(BIGINT, s.child_id) AS source_child_id,
+--               CONVERT(BIGINT, s.category_id) AS source_category_id,
+--               s.source_system
+--         INTO #src_fact_allocation
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations s
+--         LEFT JOIN Stg_FinanceOps_DB.stg_finance_ops.donations don
+--                ON don.id = s.source_id
+--               AND LOWER(ISNULL(s.source_type,N'')) = N'donation'
+--               AND don.is_valid = 1
+--               AND NOT EXISTS
+--                   (
+--                       SELECT 1
+--                       FROM Stg_FinanceOps_DB.stg_finance_ops.donations don2
+--                       WHERE don2.id = don.id
+--                         AND don2.is_valid = 1
+--                         AND don2.stg_row_id > don.stg_row_id
+--                   )
+--         LEFT JOIN dw.dim_date dd
+--                ON dd.FullDateAlternateKey = CAST(s.allocation_date AS DATE)
+--         LEFT JOIN dw.dim_donor donor
+--                ON donor.donor_id = don.donor_id
+--               AND donor.donor_key <> -1
+--         LEFT JOIN dw.dim_campaign camp
+--                ON camp.campaign_id = don.campaign_id
+--               AND camp.campaign_key <> -1
+--         LEFT JOIN dw.dim_center dc
+--                ON dc.center_id = CONVERT(BIGINT, s.center_id)
+--               AND dc.center_key <> -1
+--         LEFT JOIN dw.dim_child ch
+--                ON ch.child_id = CONVERT(BIGINT, s.child_id)
+--               AND ch.child_key <> -1
+--         LEFT JOIN dw.dim_category cat
+--                ON cat.category_id = s.category_id
+--               AND cat.category_key <> -1
+--         LEFT JOIN dw.dim_allocation_type at
+--                ON at.code = LOWER(LTRIM(RTRIM(s.source_type)))
+--               AND at.allocation_type_key <> -1
+--         WHERE s.is_valid = 1
+--           AND s.id IS NOT NULL
+--           AND (
+--                  (s.allocation_date >= CAST(@start_time AS DATE) AND s.allocation_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(s.source_updated_at, s.created_at, s.allocation_date, s.extracted_at) >= @start_time
+--                   AND COALESCE(s.source_updated_at, s.created_at, s.allocation_date, s.extracted_at) <  @end_time)
+--           )
+--           AND NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations s2
+--                   WHERE s2.id = s.id
+--                     AND s2.is_valid = 1
+--                     AND s2.stg_row_id > s.stg_row_id
+--               );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_fact_allocation ON #src_fact_allocation(source_allocation_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE f
+--            SET f.date_key             = s.date_key,
+--                f.donor_key            = s.donor_key,
+--                f.center_key           = s.center_key,
+--                f.child_key            = s.child_key,
+--                f.category_key         = s.category_key,
+--                f.campaign_key         = s.campaign_key,
+--                f.allocation_type_key  = s.allocation_type_key,
+--                f.allocated_amount     = s.allocated_amount,
+--                f.reason               = s.reason,
+--                f.source_type          = s.source_type,
+--                f.source_id            = s.source_id,
+--                f.source_center_id     = s.source_center_id,
+--                f.source_child_id      = s.source_child_id,
+--                f.source_category_id   = s.source_category_id,
+--                f.source_system        = s.source_system,
+--                f.etl_batch_id         = @etl_batch_id,
+--                f.loaded_at            = SYSDATETIME()
+--         FROM dw.fact_budget_allocation_event f
+--         INNER JOIN #src_fact_allocation s
+--                 ON s.source_allocation_id = f.source_allocation_id
+--         WHERE ISNULL(f.date_key, -1) BETWEEN @start_key AND 99991231
+--           AND (
+--                  ISNULL(f.date_key, -1) <> ISNULL(s.date_key, -1)
+--               OR ISNULL(f.donor_key, -1) <> ISNULL(s.donor_key, -1)
+--               OR ISNULL(f.center_key, -1) <> ISNULL(s.center_key, -1)
+--               OR ISNULL(f.child_key, -1) <> ISNULL(s.child_key, -1)
+--               OR ISNULL(f.category_key, -1) <> ISNULL(s.category_key, -1)
+--               OR ISNULL(f.campaign_key, -1) <> ISNULL(s.campaign_key, -1)
+--               OR ISNULL(f.allocation_type_key, -1) <> ISNULL(s.allocation_type_key, -1)
+--               OR ISNULL(f.allocated_amount, 0) <> ISNULL(s.allocated_amount, 0)
+--               OR ISNULL(f.reason, N'') <> ISNULL(s.reason, N'')
+--               OR ISNULL(f.source_type, N'') <> ISNULL(s.source_type, N'')
+--               OR ISNULL(f.source_id, -1) <> ISNULL(s.source_id, -1)
+--           );
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.fact_budget_allocation_event
+--         (
+--               date_key, donor_key, center_key, child_key, category_key, campaign_key, allocation_type_key,
+--               allocated_amount, reason, source_allocation_id, source_type, source_id, source_center_id,
+--               source_child_id, source_category_id, source_system, etl_batch_id, loaded_at
+--         )
+--         SELECT
+--               s.date_key, s.donor_key, s.center_key, s.child_key, s.category_key, s.campaign_key, s.allocation_type_key,
+--               s.allocated_amount, s.reason, s.source_allocation_id, s.source_type, s.source_id, s.source_center_id,
+--               s.source_child_id, s.source_category_id, s.source_system, @etl_batch_id, SYSDATETIME()
+--         FROM #src_fact_allocation s
+--         WHERE NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM dw.fact_budget_allocation_event f
+--                   WHERE f.source_allocation_id = s.source_allocation_id
+--               );
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(allocation_event_key) FROM dw.fact_budget_allocation_event WHERE allocation_event_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_budget_allocation_event'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'fact_budget_allocation_event', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based upsert fact_budget_allocation_event.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'budget_allocations', N'fact_budget_allocation_event', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_monthly_financial_snapshot
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+--     DECLARE @month_start DATE, @range_end DATE, @month_end DATE, @month_key INT;
+--     DECLARE @inserted INT, @updated INT;
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71501, 'Invalid period for fact_monthly_financial_snapshot.', 1;
+
+--         SET @step_started = SYSDATETIME();
+--         SET @month_start = DATEFROMPARTS(YEAR(CAST(@start_time AS DATE)), MONTH(CAST(@start_time AS DATE)), 1);
+--         SET @range_end = CAST(@end_time AS DATE);
+
+--         WHILE @month_start < @range_end
+--         BEGIN
+--             SET @month_end = EOMONTH(@month_start);
+
+--             SELECT @month_key = TimeKey
+--             FROM dw.dim_date
+--             WHERE FullDateAlternateKey = @month_end;
+
+--             IF @month_key IS NULL
+--             BEGIN
+--                 SET @rows_rejected += 1;
+--                 EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'dw_facts', N'fact_monthly_financial_snapshot', N'warning', 0, 0, 0, 1, @step_started, N'Missing month end date in dw.dim_date. Snapshot month skipped.';
+--                 SET @month_start = DATEADD(MONTH, 1, @month_start);
+--                 CONTINUE;
+--             END
+
+--             IF OBJECT_ID('tempdb..#month_movement') IS NOT NULL DROP TABLE #month_movement;
+
+--             SELECT
+--                   center_key,
+--                   SUM(total_donation_amount) AS total_donation_amount,
+--                   SUM(total_expense_amount) AS total_expense_amount,
+--                   SUM(total_payment_amount) AS total_payment_amount,
+--                   SUM(donation_count) AS donation_count,
+--                   SUM(expense_count) AS expense_count,
+--                   SUM(payment_count) AS payment_count,
+--                   SUM(allocation_count) AS allocation_count
+--             INTO #month_movement
+--             FROM
+--             (
+--                 SELECT
+--                       ISNULL(a.center_key, -1) AS center_key,
+--                       SUM(CASE WHEN LOWER(ISNULL(a.source_type,N'')) = N'donation' AND ISNULL(d.is_confirmed,0) = 1 THEN ISNULL(a.allocated_amount,0) ELSE 0 END) AS total_donation_amount,
+--                       CONVERT(DECIMAL(18,2),0) AS total_expense_amount,
+--                       CONVERT(DECIMAL(18,2),0) AS total_payment_amount,
+--                       COUNT(DISTINCT CASE WHEN LOWER(ISNULL(a.source_type,N'')) = N'donation' AND ISNULL(d.is_confirmed,0) = 1 THEN a.source_id END) AS donation_count,
+--                       0 AS expense_count,
+--                       0 AS payment_count,
+--                       COUNT_BIG(*) AS allocation_count
+--                 FROM dw.fact_budget_allocation_event a
+--                 LEFT JOIN dw.fact_donation_transaction d
+--                        ON d.source_donation_id = a.source_id
+--                 WHERE a.date_key >= CAST(CONVERT(CHAR(8), @month_start, 112) AS INT)
+--                   AND a.date_key <= CAST(CONVERT(CHAR(8), @month_end, 112) AS INT)
+--                 GROUP BY ISNULL(a.center_key, -1)
+
+--                 UNION ALL
+
+--                 SELECT
+--                       ISNULL(e.center_key, -1),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       SUM(CASE WHEN ISNULL(e.is_approved,0) = 1 THEN ISNULL(e.amount,0) ELSE 0 END),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       0,
+--                       SUM(CASE WHEN ISNULL(e.is_approved,0) = 1 THEN 1 ELSE 0 END),
+--                       0,
+--                       0
+--                 FROM dw.fact_expense_transaction e
+--                 WHERE e.date_key >= CAST(CONVERT(CHAR(8), @month_start, 112) AS INT)
+--                   AND e.date_key <= CAST(CONVERT(CHAR(8), @month_end, 112) AS INT)
+--                 GROUP BY ISNULL(e.center_key, -1)
+
+--                 UNION ALL
+
+--                 SELECT
+--                       ISNULL(p.center_key, -1),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       SUM(CASE WHEN ISNULL(p.is_paid,0) = 1 THEN ISNULL(p.amount,0) ELSE 0 END),
+--                       0,
+--                       0,
+--                       SUM(CASE WHEN ISNULL(p.is_paid,0) = 1 THEN 1 ELSE 0 END),
+--                       0
+--                 FROM dw.fact_payment_transaction p
+--                 WHERE p.date_key >= CAST(CONVERT(CHAR(8), @month_start, 112) AS INT)
+--                   AND p.date_key <= CAST(CONVERT(CHAR(8), @month_end, 112) AS INT)
+--                 GROUP BY ISNULL(p.center_key, -1)
+
+--                 UNION ALL
+
+--                 SELECT
+--                       center_key,
+--                       CONVERT(DECIMAL(18,2),0),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       CONVERT(DECIMAL(18,2),0),
+--                       0,0,0,0
+--                 FROM dw.fact_monthly_financial_snapshot
+--                 WHERE month_key = @month_key
+--             ) m
+--             GROUP BY center_key;
+
+--             CREATE CLUSTERED INDEX CX_month_movement ON #month_movement(center_key);
+--             SET @rows_read += @@ROWCOUNT;
+
+--             BEGIN TRAN;
+
+--             UPDATE f
+--                SET f.total_donation_amount = ISNULL(m.total_donation_amount, 0),
+--                    f.total_expense_amount  = ISNULL(m.total_expense_amount, 0),
+--                    f.total_payment_amount  = ISNULL(m.total_payment_amount, 0),
+--                    f.net_balance           = ISNULL(m.total_donation_amount,0) - ISNULL(m.total_expense_amount,0) - ISNULL(m.total_payment_amount,0),
+--                    f.donation_count        = ISNULL(m.donation_count, 0),
+--                    f.expense_count         = ISNULL(m.expense_count, 0),
+--                    f.payment_count         = ISNULL(m.payment_count, 0),
+--                    f.allocation_count      = ISNULL(m.allocation_count, 0),
+--                    f.source_system         = N'FINANCE_OPS',
+--                    f.etl_batch_id          = @etl_batch_id,
+--                    f.loaded_at             = SYSDATETIME()
+--             FROM dw.fact_monthly_financial_snapshot f
+--             INNER JOIN #month_movement m
+--                     ON m.center_key = f.center_key
+--                    AND f.month_key = @month_key
+--             WHERE ISNULL(f.total_donation_amount,0) <> ISNULL(m.total_donation_amount,0)
+--                OR ISNULL(f.total_expense_amount,0) <> ISNULL(m.total_expense_amount,0)
+--                OR ISNULL(f.total_payment_amount,0) <> ISNULL(m.total_payment_amount,0)
+--                OR ISNULL(f.donation_count,0) <> ISNULL(m.donation_count,0)
+--                OR ISNULL(f.expense_count,0) <> ISNULL(m.expense_count,0)
+--                OR ISNULL(f.payment_count,0) <> ISNULL(m.payment_count,0)
+--                OR ISNULL(f.allocation_count,0) <> ISNULL(m.allocation_count,0);
+--             SET @updated = @@ROWCOUNT;
+--             SET @rows_updated += @updated;
+
+--             INSERT INTO dw.fact_monthly_financial_snapshot
+--             (
+--                   month_key, center_key, total_donation_amount, total_expense_amount, total_payment_amount,
+--                   net_balance, donation_count, expense_count, payment_count, allocation_count,
+--                   source_system, etl_batch_id, loaded_at
+--             )
+--             SELECT
+--                   @month_key,
+--                   m.center_key,
+--                   ISNULL(m.total_donation_amount,0),
+--                   ISNULL(m.total_expense_amount,0),
+--                   ISNULL(m.total_payment_amount,0),
+--                   ISNULL(m.total_donation_amount,0) - ISNULL(m.total_expense_amount,0) - ISNULL(m.total_payment_amount,0),
+--                   ISNULL(m.donation_count,0),
+--                   ISNULL(m.expense_count,0),
+--                   ISNULL(m.payment_count,0),
+--                   ISNULL(m.allocation_count,0),
+--                   N'FINANCE_OPS',
+--                   @etl_batch_id,
+--                   SYSDATETIME()
+--             FROM #month_movement m
+--             WHERE NOT EXISTS
+--                   (
+--                       SELECT 1
+--                       FROM dw.fact_monthly_financial_snapshot f
+--                       WHERE f.month_key = @month_key
+--                         AND f.center_key = m.center_key
+--                   );
+--             SET @inserted = @@ROWCOUNT;
+--             SET @rows_inserted += @inserted;
+
+--             COMMIT TRAN;
+
+--             SET @month_start = DATEADD(MONTH, 1, @month_start);
+--         END
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(monthly_financial_snapshot_key) FROM dw.fact_monthly_financial_snapshot WHERE monthly_financial_snapshot_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_monthly_financial_snapshot'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'dw_fact_transactions', N'fact_monthly_financial_snapshot', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Monthly snapshot loaded from DW transaction/event facts only.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'dw_fact_transactions', N'fact_monthly_financial_snapshot', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_fact_donation_lifecycle
+--       @start_time DATETIME2(0),
+--       @end_time   DATETIME2(0)
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     DECLARE @etl_batch_id INT, @rows_read INT = 0, @rows_inserted INT = 0, @rows_updated INT = 0, @rows_rejected INT = 0, @step_started DATETIME2(0);
+
+--     BEGIN TRY
+--         EXEC etl_admin.usp_assert_finance_mart2_fact_prerequisites;
+--         EXEC etl_admin.usp_dw_start_batch N'DW_FACT', N'FINANCE_MART2', @etl_batch_id OUTPUT;
+
+--         IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--             THROW 71401, 'Invalid period for fact_donation_lifecycle.', 1;
+
+--         SET @step_started = SYSDATETIME();
+
+--         SELECT DISTINCT CONVERT(BIGINT, id) AS source_donation_id
+--         INTO #affected_donation
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.donations
+--         WHERE is_valid = 1
+--           AND id IS NOT NULL
+--           AND (
+--                  (created_at >= @start_time AND created_at < @end_time)
+--               OR (donation_date >= CAST(@start_time AS DATE) AND donation_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(source_updated_at, updated_at, extracted_at) >= @start_time AND COALESCE(source_updated_at, updated_at, extracted_at) < @end_time)
+--           )
+--         UNION
+--         SELECT DISTINCT CONVERT(BIGINT, source_id)
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations
+--         WHERE is_valid = 1
+--           AND LOWER(ISNULL(source_type,N'')) = N'donation'
+--           AND source_id IS NOT NULL
+--           AND (
+--                  (allocation_date >= CAST(@start_time AS DATE) AND allocation_date < CAST(@end_time AS DATE))
+--               OR (COALESCE(source_updated_at, created_at, extracted_at) >= @start_time AND COALESCE(source_updated_at, created_at, extracted_at) < @end_time)
+--           );
+
+--         CREATE CLUSTERED INDEX CX_affected_donation ON #affected_donation(source_donation_id);
+
+--         SELECT
+--               MIN(allocation_date) AS allocated_date,
+--               CONVERT(BIGINT, source_id) AS source_donation_id
+--         INTO #alloc_min
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.budget_allocations
+--         WHERE is_valid = 1
+--           AND LOWER(ISNULL(source_type,N'')) = N'donation'
+--           AND source_id IN (SELECT source_donation_id FROM #affected_donation)
+--         GROUP BY CONVERT(BIGINT, source_id);
+--         CREATE CLUSTERED INDEX CX_alloc_min ON #alloc_min(source_donation_id);
+
+--         SELECT
+--               ISNULL(donor.donor_key, -1) AS donor_key,
+--               ISNULL(camp.campaign_key, -1) AS campaign_key,
+--               ISNULL(created_date.TimeKey, -1) AS created_date_key,
+--               CASE WHEN LOWER(ISNULL(d.status,N'')) IN (N'confirmed', N'paid', N'completed', N'success', N'refunded') THEN ISNULL(confirm_date.TimeKey, -1) ELSE -1 END AS confirmed_date_key,
+--               ISNULL(alloc_date.TimeKey, -1) AS allocated_date_key,
+--               ISNULL(st.status_key, -1) AS lifecycle_status_key,
+--               CASE
+--                   WHEN LOWER(ISNULL(d.status,N'')) = N'refunded' THEN N'refunded'
+--                   WHEN LOWER(ISNULL(d.status,N'')) IN (N'rejected', N'cancelled') THEN N'rejected'
+--                   WHEN am.allocated_date IS NOT NULL THEN N'allocated'
+--                   WHEN LOWER(ISNULL(d.status,N'')) IN (N'confirmed', N'paid', N'completed', N'success') THEN N'confirmed'
+--                   ELSE N'created'
+--               END AS current_stage,
+--               d.amount AS donation_amount,
+--               CASE WHEN LOWER(ISNULL(d.status,N'')) IN (N'confirmed', N'paid', N'completed', N'success', N'refunded') THEN DATEDIFF(DAY, CAST(COALESCE(d.created_at, d.donation_date) AS DATE), d.donation_date) ELSE NULL END AS days_to_confirm,
+--               CASE WHEN am.allocated_date IS NOT NULL AND LOWER(ISNULL(d.status,N'')) IN (N'confirmed', N'paid', N'completed', N'success', N'refunded') THEN DATEDIFF(DAY, d.donation_date, am.allocated_date) ELSE NULL END AS days_to_allocate,
+--               CONVERT(BIGINT, d.id) AS source_donation_id,
+--               CONVERT(BIGINT, d.donor_id) AS source_donor_id,
+--               CONVERT(BIGINT, d.campaign_id) AS source_campaign_id,
+--               d.source_system
+--         INTO #src_lifecycle
+--         FROM Stg_FinanceOps_DB.stg_finance_ops.donations d
+--         INNER JOIN #affected_donation ad
+--                 ON ad.source_donation_id = CONVERT(BIGINT, d.id)
+--         LEFT JOIN #alloc_min am
+--                ON am.source_donation_id = CONVERT(BIGINT, d.id)
+--         LEFT JOIN dw.dim_donor donor
+--                ON donor.donor_id = d.donor_id
+--               AND donor.donor_key <> -1
+--         LEFT JOIN dw.dim_campaign camp
+--                ON camp.campaign_id = d.campaign_id
+--               AND camp.campaign_key <> -1
+--         LEFT JOIN dw.dim_date created_date
+--                ON created_date.FullDateAlternateKey = CAST(COALESCE(d.created_at, d.donation_date) AS DATE)
+--         LEFT JOIN dw.dim_date confirm_date
+--                ON confirm_date.FullDateAlternateKey = CAST(d.donation_date AS DATE)
+--         LEFT JOIN dw.dim_date alloc_date
+--                ON alloc_date.FullDateAlternateKey = CAST(am.allocated_date AS DATE)
+--         LEFT JOIN dw.dim_status st
+--                ON st.status_type = N'donation'
+--               AND st.code = LOWER(LTRIM(RTRIM(d.status)))
+--               AND st.status_key <> -1
+--         WHERE d.is_valid = 1
+--           AND NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM Stg_FinanceOps_DB.stg_finance_ops.donations d2
+--                   WHERE d2.id = d.id
+--                     AND d2.is_valid = 1
+--                     AND d2.stg_row_id > d.stg_row_id
+--               );
+
+--         SET @rows_read = @@ROWCOUNT;
+--         CREATE CLUSTERED INDEX CX_src_lifecycle ON #src_lifecycle(source_donation_id);
+
+--         BEGIN TRAN;
+
+--         UPDATE f
+--            SET f.donor_key            = s.donor_key,
+--                f.campaign_key         = s.campaign_key,
+--                f.created_date_key     = s.created_date_key,
+--                f.confirmed_date_key   = s.confirmed_date_key,
+--                f.allocated_date_key   = s.allocated_date_key,
+--                f.lifecycle_status_key = s.lifecycle_status_key,
+--                f.current_stage        = s.current_stage,
+--                f.donation_amount      = s.donation_amount,
+--                f.days_to_confirm      = s.days_to_confirm,
+--                f.days_to_allocate     = s.days_to_allocate,
+--                f.source_donor_id      = s.source_donor_id,
+--                f.source_campaign_id   = s.source_campaign_id,
+--                f.source_system        = s.source_system,
+--                f.etl_batch_id         = @etl_batch_id,
+--                f.loaded_at            = SYSDATETIME()
+--         FROM dw.fact_donation_lifecycle f
+--         INNER JOIN #src_lifecycle s
+--                 ON s.source_donation_id = f.source_donation_id
+--         WHERE (
+--                  ISNULL(f.donor_key, -1) <> ISNULL(s.donor_key, -1)
+--               OR ISNULL(f.campaign_key, -1) <> ISNULL(s.campaign_key, -1)
+--               OR ISNULL(f.created_date_key, -1) <> ISNULL(s.created_date_key, -1)
+--               OR ISNULL(f.confirmed_date_key, -1) <> ISNULL(s.confirmed_date_key, -1)
+--               OR ISNULL(f.allocated_date_key, -1) <> ISNULL(s.allocated_date_key, -1)
+--               OR ISNULL(f.lifecycle_status_key, -1) <> ISNULL(s.lifecycle_status_key, -1)
+--               OR ISNULL(f.current_stage, N'') <> ISNULL(s.current_stage, N'')
+--               OR ISNULL(f.donation_amount, 0) <> ISNULL(s.donation_amount, 0)
+--               OR ISNULL(f.days_to_confirm, -999999) <> ISNULL(s.days_to_confirm, -999999)
+--               OR ISNULL(f.days_to_allocate, -999999) <> ISNULL(s.days_to_allocate, -999999)
+--           );
+--         SET @rows_updated = @@ROWCOUNT;
+
+--         INSERT INTO dw.fact_donation_lifecycle
+--         (
+--               donor_key, campaign_key, created_date_key, confirmed_date_key, allocated_date_key,
+--               lifecycle_status_key, current_stage, donation_amount, days_to_confirm, days_to_allocate,
+--               source_donation_id, source_donor_id, source_campaign_id, source_system, etl_batch_id, loaded_at
+--         )
+--         SELECT
+--               s.donor_key, s.campaign_key, s.created_date_key, s.confirmed_date_key, s.allocated_date_key,
+--               s.lifecycle_status_key, s.current_stage, s.donation_amount, s.days_to_confirm, s.days_to_allocate,
+--               s.source_donation_id, s.source_donor_id, s.source_campaign_id, s.source_system, @etl_batch_id, SYSDATETIME()
+--         FROM #src_lifecycle s
+--         WHERE NOT EXISTS
+--               (
+--                   SELECT 1
+--                   FROM dw.fact_donation_lifecycle f
+--                   WHERE f.source_donation_id = s.source_donation_id
+--               );
+--         SET @rows_inserted = @@ROWCOUNT;
+
+--         DECLARE @max_key BIGINT = ISNULL((SELECT MAX(donation_lifecycle_key) FROM dw.fact_donation_lifecycle WHERE donation_lifecycle_key > 0), 0);
+--         DECLARE @checkident_sql NVARCHAR(MAX) = N'DBCC CHECKIDENT (''dw.fact_donation_lifecycle'', RESEED, ' + CONVERT(NVARCHAR(30), @max_key) + N') WITH NO_INFOMSGS';
+--         EXEC sys.sp_executesql @checkident_sql;
+
+--         COMMIT TRAN;
+
+--         EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations/budget_allocations', N'fact_donation_lifecycle', N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, N'Set-based accumulating snapshot update for affected donations.';
+--         EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'succeeded', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, NULL;
+--     END TRY
+--     BEGIN CATCH
+--         DECLARE @error_message NVARCHAR(MAX) = ERROR_MESSAGE();
+--         IF XACT_STATE() <> 0 ROLLBACK TRAN;
+--         IF @etl_batch_id IS NOT NULL
+--         BEGIN
+--             EXEC etl_admin.usp_dw_log_step @etl_batch_id, N'donations/budget_allocations', N'fact_donation_lifecycle', N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @step_started, @error_message;
+--             EXEC etl_admin.usp_dw_finish_batch @etl_batch_id, N'failed', @rows_read, @rows_inserted, @rows_updated, @rows_rejected, @error_message;
+--         END
+--         ;THROW;
+--     END CATCH
+-- END
+-- GO
+
+
+-- CREATE OR ALTER PROCEDURE etl_admin.usp_first_load_dw_finance_mart2_all
+--       @start_time  DATETIME2(0),
+--       @end_time    DATETIME2(0),
+--       @run_staging BIT = 0
+-- AS
+-- BEGIN
+--     SET NOCOUNT ON;
+--     SET XACT_ABORT ON;
+
+--     IF @start_time IS NULL OR @end_time IS NULL OR @start_time >= @end_time
+--         THROW 72001, 'Invalid period for first-load finance mart2 orchestration.', 1;
+
+--     IF @run_staging = 1
+--     BEGIN
+--         EXEC Stg_FinanceOps_DB.etl_admin.usp_run_stg_finance_ops_all
+--              @to_date = @end_time,
+--              @etl_batch_id = NULL;
+--     END
+
+--     EXEC etl_admin.usp_first_load_dw_dim_donor @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_campaign @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_category @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_donation_type @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_status @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_currency @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_dim_allocation_type @start_time, @end_time;
+
+--     EXEC etl_admin.usp_first_load_dw_fact_donation_transaction @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_fact_expense_transaction @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_fact_payment_transaction @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_fact_budget_allocation_event @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_fact_monthly_financial_snapshot @start_time, @end_time;
+--     EXEC etl_admin.usp_first_load_dw_fact_donation_lifecycle @start_time, @end_time;
+-- END
+-- GO
 
 

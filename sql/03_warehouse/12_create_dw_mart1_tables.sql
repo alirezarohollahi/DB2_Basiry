@@ -41,6 +41,7 @@ GO
 =============================================================================*/
 
 DROP TABLE IF EXISTS dw.fact_child_task_event;
+--lifecycle fact (accumulation)
 DROP TABLE IF EXISTS dw.fact_child_snapshot_accumulation;
 DROP TABLE IF EXISTS dw.fact_daily_student_task_progress;
 DROP TABLE IF EXISTS dw.fact_tran_student_task_progress;
