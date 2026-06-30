@@ -14,7 +14,7 @@
        Stg_FinanceOps_DB.stg_finance_ops
 
  Important change:
-   This version does NOT use SQL Server UPDATE/INSERT.
+   This version uses persistent staging work tables instead of session-local #temp tables.
 
  Loading strategy:
    1. Small/master tables:
@@ -52,7 +52,8 @@
    1. Source_FinanceOps_DB exists and has data.
    2. Stg_FinanceOps_DB exists.
    3. stg_finance_ops tables exist.
-   4. etl_admin.etl_batch and etl_admin.etl_load_log exist.
+   4. stg_finance_ops ETL work tables exist.
+   5. etl_admin.etl_batch and etl_admin.etl_load_log exist.
 ===============================================================================
 */
 
@@ -128,10 +129,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donors_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donors_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donors_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_donors_src
+            ([id], [full_name], [national_id], [phone], [email], [donor_type], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[full_name] AS [full_name],
@@ -144,27 +147,50 @@ BEGIN
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[full_name]), CONVERT(NVARCHAR(MAX), src.[national_id]), CONVERT(NVARCHAR(MAX), src.[phone]), CONVERT(NVARCHAR(MAX), src.[email]), CONVERT(NVARCHAR(MAX), src.[donor_type]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.donors src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_donors_validated
+            ([id], [full_name], [national_id], [phone], [email], [donor_type], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[full_name],
+            s.[national_id],
+            s.[phone],
+            s.[email],
+            s.[donor_type],
+            s.[is_active],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN full_name IS NULL THEN N'full_name missing; ' ELSE N'' END, CASE WHEN donor_type IS NULL THEN N'donor_type missing; ' ELSE N'' END, CASE WHEN donor_type IS NOT NULL AND donor_type NOT IN (N'individual', N'organization') THEN N'donor_type invalid: donor_type NOT IN (individual, organization); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_donors_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_donors_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_donors_valid
+            ([id], [full_name], [national_id], [phone], [email], [donor_type], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [full_name],
+            [national_id],
+            [phone],
+            [email],
+            [donor_type],
+            [is_active],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_donors_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -199,7 +225,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src;
+        FROM stg_finance_ops.etl_tmp_donors_valid src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -334,10 +360,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_campaigns_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_campaigns_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_campaigns_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_campaigns_src
+            ([id], [title], [description], [target_amount], [start_date], [end_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[title] AS [title],
@@ -350,27 +378,50 @@ BEGIN
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[title]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[target_amount]), CONVERT(NVARCHAR(MAX), src.[start_date]), CONVERT(NVARCHAR(MAX), src.[end_date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.campaigns src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_campaigns_validated
+            ([id], [title], [description], [target_amount], [start_date], [end_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[title],
+            s.[description],
+            s.[target_amount],
+            s.[start_date],
+            s.[end_date],
+            s.[status],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN title IS NULL THEN N'title missing; ' ELSE N'' END, CASE WHEN target_amount IS NOT NULL AND target_amount < 0 THEN N'target_amount invalid: target_amount < 0; ' ELSE N'' END, CASE WHEN start_date IS NOT NULL AND end_date IS NOT NULL AND start_date > end_date THEN N'start_date invalid: end_date invalid: start_date > end_date; ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_campaigns_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_campaigns_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_campaigns_valid
+            ([id], [title], [description], [target_amount], [start_date], [end_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [title],
+            [description],
+            [target_amount],
+            [start_date],
+            [end_date],
+            [status],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_campaigns_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -405,7 +456,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src;
+        FROM stg_finance_ops.etl_tmp_campaigns_valid src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -540,40 +591,56 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expense_categories_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expense_categories_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expense_categories_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_expense_categories_src
+            ([id], [name], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[name] AS [name],
-            src.[parent_id] AS [parent_id],
             src.[is_active] AS [is_active],
             src.[created_at] AS [created_at],
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
-            HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[name]), CONVERT(NVARCHAR(MAX), src.[parent_id]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
+            HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[name]), CONVERT(NVARCHAR(MAX), src.[is_active]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
         FROM Source_FinanceOps_DB.finance_ops.expense_categories src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_expense_categories_validated
+            ([id], [name], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
-            NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN name IS NULL THEN N'name missing; ' ELSE N'' END, CASE WHEN parent_id IS NOT NULL AND parent_id = id THEN N'parent_id invalid: parent_id = id; ' ELSE N'' END, CASE WHEN parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.parent_id) THEN N'parent_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.parent_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+            s.[id],
+            s.[name],
+            s.[is_active],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
+            NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN name IS NULL THEN N'name missing; ' ELSE N'' END), N'') AS validation_message
+        FROM stg_finance_ops.etl_tmp_expense_categories_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_expense_categories_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_expense_categories_valid
+            ([id], [name], [is_active], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [name],
+            [is_active],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_expense_categories_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -587,11 +654,10 @@ BEGIN
         TRUNCATE TABLE stg_finance_ops.expense_categories;
 
         INSERT INTO stg_finance_ops.expense_categories
-            ([id], [name], [parent_id], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
+            ([id], [name], [is_active], [created_at], [updated_at], [etl_batch_id], [source_system], [source_database], [source_schema], [source_table], [extracted_at], [source_updated_at], [row_hash], [is_valid], [validation_message])
         SELECT
                 src.[id],
                 src.[name],
-                src.[parent_id],
                 src.[is_active],
                 src.[created_at],
                 src.[updated_at],
@@ -605,7 +671,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src;
+        FROM stg_finance_ops.etl_tmp_expense_categories_valid src;
 
         SET @rows_inserted = @@ROWCOUNT;
         SET @rows_updated = 0;
@@ -740,10 +806,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donations_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donations_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_donations_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_donations_src
+            ([id], [donor_id], [campaign_id], [amount], [currency], [donation_type], [donation_date], [status], [reference_code], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[donor_id] AS [donor_id],
@@ -758,27 +826,54 @@ BEGIN
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[donor_id]), CONVERT(NVARCHAR(MAX), src.[campaign_id]), CONVERT(NVARCHAR(MAX), src.[amount]), CONVERT(NVARCHAR(MAX), src.[currency]), CONVERT(NVARCHAR(MAX), src.[donation_type]), CONVERT(NVARCHAR(MAX), src.[donation_date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[reference_code]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.donations src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_donations_validated
+            ([id], [donor_id], [campaign_id], [amount], [currency], [donation_type], [donation_date], [status], [reference_code], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[donor_id],
+            s.[campaign_id],
+            s.[amount],
+            s.[currency],
+            s.[donation_type],
+            s.[donation_date],
+            s.[status],
+            s.[reference_code],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN donor_id IS NULL THEN N'donor_id missing; ' ELSE N'' END, CASE WHEN amount IS NULL THEN N'amount missing; ' ELSE N'' END, CASE WHEN amount IS NOT NULL AND amount <= 0 THEN N'amount invalid: amount <= 0; ' ELSE N'' END, CASE WHEN currency IS NULL THEN N'currency missing; ' ELSE N'' END, CASE WHEN donation_type IS NULL THEN N'donation_type missing; ' ELSE N'' END, CASE WHEN donation_date IS NULL THEN N'donation_date missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN donation_type IS NOT NULL AND donation_type NOT IN (N'cash', N'bank_transfer', N'online', N'in_kind') THEN N'donation_type invalid: donation_type NOT IN (cash, bank_transfer, online, in_kind); ' ELSE N'' END, CASE WHEN status IS NOT NULL AND status NOT IN (N'pending', N'confirmed', N'rejected', N'refunded') THEN N'status invalid: status NOT IN (pending, confirmed, rejected, refunded); ' ELSE N'' END, CASE WHEN donor_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donors p WHERE p.id = s.donor_id) THEN N'donor_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donors p WHERE p.id = s.donor_id); ' ELSE N'' END, CASE WHEN campaign_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.campaigns p WHERE p.id = s.campaign_id) THEN N'campaign_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.campaigns p WHERE p.id = s.campaign_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_donations_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_donations_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_donations_valid
+            ([id], [donor_id], [campaign_id], [amount], [currency], [donation_type], [donation_date], [status], [reference_code], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [donor_id],
+            [campaign_id],
+            [amount],
+            [currency],
+            [donation_type],
+            [donation_date],
+            [status],
+            [reference_code],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_donations_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -787,7 +882,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Large/transactional table. Do not truncate.
         */
         UPDATE tgt
@@ -813,7 +908,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.donations tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_donations_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -847,7 +942,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_donations_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.donations tgt
@@ -986,10 +1081,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expenses_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expenses_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_expenses_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_expenses_src
+            ([id], [center_id], [child_id], [category_id], [amount], [currency], [expense_date], [description], [approved_by_user_id], [status], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[center_id] AS [center_id],
@@ -1005,27 +1102,56 @@ BEGIN
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[category_id]), CONVERT(NVARCHAR(MAX), src.[amount]), CONVERT(NVARCHAR(MAX), src.[currency]), CONVERT(NVARCHAR(MAX), src.[expense_date]), CONVERT(NVARCHAR(MAX), src.[description]), CONVERT(NVARCHAR(MAX), src.[approved_by_user_id]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.expenses src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_expenses_validated
+            ([id], [center_id], [child_id], [category_id], [amount], [currency], [expense_date], [description], [approved_by_user_id], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[center_id],
+            s.[child_id],
+            s.[category_id],
+            s.[amount],
+            s.[currency],
+            s.[expense_date],
+            s.[description],
+            s.[approved_by_user_id],
+            s.[status],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN category_id IS NULL THEN N'category_id missing; ' ELSE N'' END, CASE WHEN amount IS NULL THEN N'amount missing; ' ELSE N'' END, CASE WHEN amount IS NOT NULL AND amount <= 0 THEN N'amount invalid: amount <= 0; ' ELSE N'' END, CASE WHEN currency IS NULL THEN N'currency missing; ' ELSE N'' END, CASE WHEN expense_date IS NULL THEN N'expense_date missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN status IS NOT NULL AND status NOT IN (N'pending', N'approved', N'rejected') THEN N'status invalid: status NOT IN (pending, approved, rejected); ' ELSE N'' END, CASE WHEN category_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.category_id) THEN N'category_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.category_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_expenses_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_expenses_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_expenses_valid
+            ([id], [center_id], [child_id], [category_id], [amount], [currency], [expense_date], [description], [approved_by_user_id], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [center_id],
+            [child_id],
+            [category_id],
+            [amount],
+            [currency],
+            [expense_date],
+            [description],
+            [approved_by_user_id],
+            [status],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_expenses_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -1034,7 +1160,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Large/transactional table. Do not truncate.
         */
         UPDATE tgt
@@ -1061,7 +1187,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.expenses tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_expenses_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -1096,7 +1222,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_expenses_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.expenses tgt
@@ -1235,10 +1361,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_payments_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_payments_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_payments_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_payments_src
+            ([id], [payment_type], [teacher_id], [center_id], [amount], [currency], [payment_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[payment_type] AS [payment_type],
@@ -1252,27 +1380,52 @@ BEGIN
             src.[updated_at] AS [updated_at],
             CAST(COALESCE(updated_at, created_at) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[payment_type]), CONVERT(NVARCHAR(MAX), src.[teacher_id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[amount]), CONVERT(NVARCHAR(MAX), src.[currency]), CONVERT(NVARCHAR(MAX), src.[payment_date]), CONVERT(NVARCHAR(MAX), src.[status]), CONVERT(NVARCHAR(MAX), src.[created_at]), CONVERT(NVARCHAR(MAX), src.[updated_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.payments src
         WHERE COALESCE(updated_at, created_at) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_payments_validated
+            ([id], [payment_type], [teacher_id], [center_id], [amount], [currency], [payment_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[payment_type],
+            s.[teacher_id],
+            s.[center_id],
+            s.[amount],
+            s.[currency],
+            s.[payment_date],
+            s.[status],
+            s.[created_at],
+            s.[updated_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN payment_type IS NULL THEN N'payment_type missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN amount IS NULL THEN N'amount missing; ' ELSE N'' END, CASE WHEN amount IS NOT NULL AND amount <= 0 THEN N'amount invalid: amount <= 0; ' ELSE N'' END, CASE WHEN currency IS NULL THEN N'currency missing; ' ELSE N'' END, CASE WHEN payment_date IS NULL THEN N'payment_date missing; ' ELSE N'' END, CASE WHEN status IS NULL THEN N'status missing; ' ELSE N'' END, CASE WHEN payment_type IS NOT NULL AND payment_type NOT IN (N'salary', N'bonus', N'vendor', N'refund') THEN N'payment_type invalid: payment_type NOT IN (salary, bonus, vendor, refund); ' ELSE N'' END, CASE WHEN status IS NOT NULL AND status NOT IN (N'pending', N'approved', N'paid', N'cancelled', N'rejected') THEN N'status invalid: status NOT IN (pending, approved, paid, cancelled, rejected); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_payments_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_payments_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_payments_valid
+            ([id], [payment_type], [teacher_id], [center_id], [amount], [currency], [payment_date], [status], [created_at], [updated_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [payment_type],
+            [teacher_id],
+            [center_id],
+            [amount],
+            [currency],
+            [payment_date],
+            [status],
+            [created_at],
+            [updated_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_payments_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -1281,7 +1434,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Transactional table. Do not truncate.
         */
         UPDATE tgt
@@ -1306,7 +1459,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.payments tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_payments_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -1339,7 +1492,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_payments_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.payments tgt
@@ -1478,10 +1631,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_budget_allocations_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_budget_allocations_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_budget_allocations_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_budget_allocations_src
+            ([id], [source_type], [source_id], [center_id], [child_id], [category_id], [allocated_amount], [allocation_date], [reason], [created_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[source_type] AS [source_type],
@@ -1495,27 +1650,52 @@ BEGIN
             src.[created_at] AS [created_at],
             CAST(CAST(created_at AS DATETIME2(0)) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[source_type]), CONVERT(NVARCHAR(MAX), src.[source_id]), CONVERT(NVARCHAR(MAX), src.[center_id]), CONVERT(NVARCHAR(MAX), src.[child_id]), CONVERT(NVARCHAR(MAX), src.[category_id]), CONVERT(NVARCHAR(MAX), src.[allocated_amount]), CONVERT(NVARCHAR(MAX), src.[allocation_date]), CONVERT(NVARCHAR(MAX), src.[reason]), CONVERT(NVARCHAR(MAX), src.[created_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.budget_allocations src
         WHERE CAST(created_at AS DATETIME2(0)) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_budget_allocations_validated
+            ([id], [source_type], [source_id], [center_id], [child_id], [category_id], [allocated_amount], [allocation_date], [reason], [created_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[source_type],
+            s.[source_id],
+            s.[center_id],
+            s.[child_id],
+            s.[category_id],
+            s.[allocated_amount],
+            s.[allocation_date],
+            s.[reason],
+            s.[created_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN source_type IS NULL THEN N'source_type missing; ' ELSE N'' END, CASE WHEN center_id IS NULL THEN N'center_id missing; ' ELSE N'' END, CASE WHEN allocated_amount IS NULL THEN N'allocated_amount missing; ' ELSE N'' END, CASE WHEN allocated_amount IS NOT NULL AND allocated_amount <= 0 THEN N'allocated_amount invalid: allocated_amount <= 0; ' ELSE N'' END, CASE WHEN allocation_date IS NULL THEN N'allocation_date missing; ' ELSE N'' END, CASE WHEN source_type IS NOT NULL AND source_type NOT IN (N'donation', N'internal_budget') THEN N'source_type invalid: source_type NOT IN (donation, internal_budget); ' ELSE N'' END, CASE WHEN source_type = N'donation' AND source_id IS NULL THEN N'source_type = donation AND source_id missing; ' ELSE N'' END, CASE WHEN source_type = N'donation' AND source_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donations p WHERE p.id = s.source_id) THEN N'source_type = donation AND source_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donations p WHERE p.id = s.source_id); ' ELSE N'' END, CASE WHEN category_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.category_id) THEN N'category_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expense_categories p WHERE p.id = s.category_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_budget_allocations_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_budget_allocations_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_budget_allocations_valid
+            ([id], [source_type], [source_id], [center_id], [child_id], [category_id], [allocated_amount], [allocation_date], [reason], [created_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [source_type],
+            [source_id],
+            [center_id],
+            [child_id],
+            [category_id],
+            [allocated_amount],
+            [allocation_date],
+            [reason],
+            [created_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_budget_allocations_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -1524,7 +1704,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Event table. Do not truncate.
         */
         UPDATE tgt
@@ -1549,7 +1729,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.budget_allocations tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_budget_allocations_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -1582,7 +1762,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_budget_allocations_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.budget_allocations tgt
@@ -1721,10 +1901,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_financial_transactions_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_financial_transactions_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_financial_transactions_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_financial_transactions_src
+            ([id], [entity_type], [entity_id], [transaction_type], [amount], [transaction_date], [created_at], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[entity_type] AS [entity_type],
@@ -1735,27 +1917,46 @@ BEGIN
             src.[created_at] AS [created_at],
             CAST(CAST(created_at AS DATETIME2(0)) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[entity_type]), CONVERT(NVARCHAR(MAX), src.[entity_id]), CONVERT(NVARCHAR(MAX), src.[transaction_type]), CONVERT(NVARCHAR(MAX), src.[amount]), CONVERT(NVARCHAR(MAX), src.[transaction_date]), CONVERT(NVARCHAR(MAX), src.[created_at]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.financial_transactions src
         WHERE CAST(created_at AS DATETIME2(0)) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_financial_transactions_validated
+            ([id], [entity_type], [entity_id], [transaction_type], [amount], [transaction_date], [created_at], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[entity_type],
+            s.[entity_id],
+            s.[transaction_type],
+            s.[amount],
+            s.[transaction_date],
+            s.[created_at],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN entity_type IS NULL THEN N'entity_type missing; ' ELSE N'' END, CASE WHEN entity_id IS NULL THEN N'entity_id missing; ' ELSE N'' END, CASE WHEN transaction_type IS NULL THEN N'transaction_type missing; ' ELSE N'' END, CASE WHEN amount IS NULL THEN N'amount missing; ' ELSE N'' END, CASE WHEN amount IS NOT NULL AND amount <= 0 THEN N'amount invalid: amount <= 0; ' ELSE N'' END, CASE WHEN transaction_date IS NULL THEN N'transaction_date missing; ' ELSE N'' END, CASE WHEN entity_type IS NOT NULL AND entity_type NOT IN (N'donation', N'expense', N'payment') THEN N'entity_type invalid: entity_type NOT IN (donation, expense, payment); ' ELSE N'' END, CASE WHEN transaction_type IS NOT NULL AND transaction_type NOT IN (N'credit', N'debit') THEN N'transaction_type invalid: transaction_type NOT IN (credit, debit); ' ELSE N'' END, CASE WHEN entity_type = N'donation' AND entity_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donations p WHERE p.id = s.entity_id) THEN N'entity_type = donation AND entity_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.donations p WHERE p.id = s.entity_id); ' ELSE N'' END, CASE WHEN entity_type = N'expense' AND entity_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expenses p WHERE p.id = s.entity_id) THEN N'entity_type = expense AND entity_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.expenses p WHERE p.id = s.entity_id); ' ELSE N'' END, CASE WHEN entity_type = N'payment' AND entity_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.payments p WHERE p.id = s.entity_id) THEN N'entity_type = payment AND entity_id invalid reference (SELECT 1 FROM Source_FinanceOps_DB.finance_ops.payments p WHERE p.id = s.entity_id); ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_financial_transactions_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_financial_transactions_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_financial_transactions_valid
+            ([id], [entity_type], [entity_id], [transaction_type], [amount], [transaction_date], [created_at], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [entity_type],
+            [entity_id],
+            [transaction_type],
+            [amount],
+            [transaction_date],
+            [created_at],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_financial_transactions_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -1764,7 +1965,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Audit/transaction table. Do not truncate.
         */
         UPDATE tgt
@@ -1786,7 +1987,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.financial_transactions tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_financial_transactions_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -1816,7 +2017,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_financial_transactions_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.financial_transactions tgt
@@ -1955,10 +2156,12 @@ BEGIN
 
         BEGIN TRANSACTION;
 
-        IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-        IF OBJECT_ID('tempdb..#validated') IS NOT NULL DROP TABLE #validated;
-        IF OBJECT_ID('tempdb..#valid') IS NOT NULL DROP TABLE #valid;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_currency_rates_src;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_currency_rates_validated;
+        TRUNCATE TABLE stg_finance_ops.etl_tmp_currency_rates_valid;
 
+        INSERT INTO stg_finance_ops.etl_tmp_currency_rates_src
+            ([id], [from_currency], [to_currency], [rate], [rate_date], [source_updated_at], [row_hash])
         SELECT
             src.[id] AS [id],
             src.[from_currency] AS [from_currency],
@@ -1967,27 +2170,42 @@ BEGIN
             src.[rate_date] AS [rate_date],
             CAST(CAST(rate_date AS DATETIME2(0)) AS DATETIME2(0)) AS source_updated_at,
             HASHBYTES('SHA2_256', CONCAT_WS(N'|', CONVERT(NVARCHAR(MAX), src.[id]), CONVERT(NVARCHAR(MAX), src.[from_currency]), CONVERT(NVARCHAR(MAX), src.[to_currency]), CONVERT(NVARCHAR(MAX), src.[rate]), CONVERT(NVARCHAR(MAX), src.[rate_date]))) AS row_hash
-        INTO #src
         FROM Source_FinanceOps_DB.finance_ops.currency_rates src
         WHERE CAST(rate_date AS DATETIME2(0)) <= @to_date;
 
         SET @rows_read = @@ROWCOUNT;
 
+        INSERT INTO stg_finance_ops.etl_tmp_currency_rates_validated
+            ([id], [from_currency], [to_currency], [rate], [rate_date], [source_updated_at], [row_hash], [validation_message])
         SELECT
-            s.*,
+            s.[id],
+            s.[from_currency],
+            s.[to_currency],
+            s.[rate],
+            s.[rate_date],
+            s.[source_updated_at],
+            s.[row_hash],
             NULLIF(CONCAT(CASE WHEN id IS NULL THEN N'id missing; ' ELSE N'' END, CASE WHEN from_currency IS NULL THEN N'from_currency missing; ' ELSE N'' END, CASE WHEN to_currency IS NULL THEN N'to_currency missing; ' ELSE N'' END, CASE WHEN rate IS NULL THEN N'rate missing; ' ELSE N'' END, CASE WHEN rate IS NOT NULL AND rate <= 0 THEN N'rate invalid: rate <= 0; ' ELSE N'' END, CASE WHEN rate_date IS NULL THEN N'rate_date missing; ' ELSE N'' END), N'') AS validation_message
-        INTO #validated
-        FROM #src s;
+        FROM stg_finance_ops.etl_tmp_currency_rates_src s;
 
         SET @rows_rejected = (
             SELECT COUNT(*)
-            FROM #validated
+            FROM stg_finance_ops.etl_tmp_currency_rates_validated
             WHERE validation_message IS NOT NULL
         );
 
-        SELECT *
-        INTO #valid
-        FROM #validated
+        INSERT INTO stg_finance_ops.etl_tmp_currency_rates_valid
+            ([id], [from_currency], [to_currency], [rate], [rate_date], [source_updated_at], [row_hash], [validation_message])
+        SELECT
+            [id],
+            [from_currency],
+            [to_currency],
+            [rate],
+            [rate_date],
+            [source_updated_at],
+            [row_hash],
+            [validation_message]
+        FROM stg_finance_ops.etl_tmp_currency_rates_validated
         WHERE validation_message IS NULL;
 
         SET @rows_valid = @@ROWCOUNT;
@@ -1996,7 +2214,7 @@ BEGIN
         /*
           Large/transactional table strategy:
           UPDATE existing rows first, then INSERT new rows.
-          No UPDATE/INSERT and no full reload.
+          No truncate/reload for large tables.
           Reason: Can grow over time, so use update + insert.
         */
         UPDATE tgt
@@ -2016,7 +2234,7 @@ BEGIN
                 tgt.is_valid = 1,
                 tgt.validation_message = NULL
         FROM stg_finance_ops.currency_rates tgt
-        INNER JOIN #valid src
+        INNER JOIN stg_finance_ops.etl_tmp_currency_rates_valid src
             ON src.[id] = tgt.[id]
         WHERE
             tgt.row_hash IS NULL
@@ -2044,7 +2262,7 @@ BEGIN
                 src.row_hash,
                 1,
                 NULL
-        FROM #valid src
+        FROM stg_finance_ops.etl_tmp_currency_rates_valid src
         WHERE NOT EXISTS (
             SELECT 1
             FROM stg_finance_ops.currency_rates tgt

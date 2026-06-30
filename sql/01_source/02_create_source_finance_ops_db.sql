@@ -150,6 +150,7 @@ CREATE TABLE finance_ops.donations (
     CONSTRAINT CK_finance_donations_status
         CHECK (status IN (N'pending', N'confirmed', N'rejected', N'refunded')),
     CONSTRAINT UQ_finance_donations_reference_code UNIQUE (reference_code)
+
 );
 GO
 
@@ -160,17 +161,15 @@ GO
 CREATE TABLE finance_ops.expense_categories (
     id              INT IDENTITY(1,1) NOT NULL,
     name            NVARCHAR(200) NOT NULL,
-    parent_id       INT NULL,
     is_active       BIT NOT NULL CONSTRAINT DF_finance_expense_categories_is_active DEFAULT (1),
     created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_expense_categories_created_at DEFAULT (SYSDATETIME()),
     updated_at      DATETIME2(0) NULL,
 
     CONSTRAINT PK_finance_expense_categories PRIMARY KEY CLUSTERED (id),
-    CONSTRAINT FK_finance_expense_categories_parent
-        FOREIGN KEY (parent_id) REFERENCES finance_ops.expense_categories(id),
     CONSTRAINT UQ_finance_expense_categories_name UNIQUE (name)
 );
 GO
+
 
 CREATE TABLE finance_ops.expenses (
     id                      INT IDENTITY(1,1) NOT NULL,

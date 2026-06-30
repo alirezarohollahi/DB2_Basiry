@@ -366,6 +366,7 @@ CREATE TABLE dw.fact_donation_lifecycle (
     days_to_confirm        INT NULL,
     days_to_allocate       INT NULL,
 
+
     source_donation_id     BIGINT NULL,
     source_donor_id        BIGINT NULL,
     source_campaign_id     BIGINT NULL,

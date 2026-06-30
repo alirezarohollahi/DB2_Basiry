@@ -1,457 +1,358 @@
 /*
 ===============================================================================
  Project      : Charity Data Warehouse Project
- Phase        : Phase 2 - Staging Layer
- File         : 08_create_stg_finance_ops_tables.sql
+ Phase        : Phase 1 - Operational Source Databases
+ File         : 02_create_source_finance_ops_db_fixed.sql
  DBMS         : Microsoft SQL Server
  Tool         : SQL Server Management Studio (SSMS)
 
  Purpose:
-   Create staging tables under Stg_FinanceOps_DB.stg_finance_ops.
+   Create the operational source database for Finance Operations:
+   donors, campaigns, donations, expense categories, expenses, payments,
+   budget allocations, financial transactions, and currency rates.
 
- Prerequisite:
-   Run this first:
-   - 07_create_stg_finance_ops_db.sql
+ Naming decision:
+   Database : Source_FinanceOps_DB
+   Schema   : finance_ops
 
- Design:
-   - Tables mirror Source_FinanceOps_DB.finance_ops source tables.
-   - No business foreign keys are created in staging.
-   - Staging should accept source data as-is, then validation is done later.
-   - Every staging table has ETL metadata columns:
-       stg_row_id
-       etl_batch_id
-       source_system
-       source_database
-       source_schema
-       source_table
-       extracted_at
-       source_updated_at
-       row_hash
-       is_valid
-       validation_message
+ Important shared-entity decision:
+   This finance source uses reference IDs for shared business entities:
+   - center_id
+   - child_id
+   - teacher_id
 
- Why no foreign keys in staging?
-   Staging is a landing area. It should not reject source rows too early.
-   Data-quality issues should be loaded, detected, logged, and handled by ETL.
+   These IDs refer conceptually to entities managed in Source_ProgramOps_DB,
+   but cross-database foreign keys are intentionally avoided in the source layer.
+   In the warehouse layer, these will be integrated through conformed dimensions:
+   - dw.dim_center
+   - dw.dim_child
+   - dw.dim_teacher
+   - dw.dim_date
 
- Source system:
-   Source_FinanceOps_DB.finance_ops
+ Notes:
+   - This script is development-friendly and re-runnable.
+   - All operational source finance tables are created under schema finance_ops.
+   - This is a normalized OLTP-style source database.
 ===============================================================================
 */
 
 SET NOCOUNT ON;
 GO
 
-USE Stg_FinanceOps_DB;
-GO
-
 /*=============================================================================
-  1. Verify Required Schemas
+  1. Create Database
 =============================================================================*/
 
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'stg_finance_ops')
+IF DB_ID(N'Source_FinanceOps_DB') IS NULL
 BEGIN
-    EXEC(N'CREATE SCHEMA stg_finance_ops');
+    CREATE DATABASE Source_FinanceOps_DB;
 END
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl_admin')
+USE Source_FinanceOps_DB;
+GO
+
+/*=============================================================================
+  2. Create Schema
+=============================================================================*/
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = N'finance_ops'
+)
 BEGIN
-    EXEC(N'CREATE SCHEMA etl_admin');
+    EXEC(N'CREATE SCHEMA finance_ops');
 END
 GO
 
 /*=============================================================================
-  2. Drop Existing Staging Tables
-     Development-friendly and re-runnable.
+  3. Drop Existing Tables
+
+     This makes the script re-runnable during development.
 =============================================================================*/
 
-DROP TABLE IF EXISTS stg_finance_ops.currency_rates;
-DROP TABLE IF EXISTS stg_finance_ops.financial_transactions;
-DROP TABLE IF EXISTS stg_finance_ops.budget_allocations;
-DROP TABLE IF EXISTS stg_finance_ops.payments;
-DROP TABLE IF EXISTS stg_finance_ops.expenses;
-DROP TABLE IF EXISTS stg_finance_ops.expense_categories;
-DROP TABLE IF EXISTS stg_finance_ops.donations;
-DROP TABLE IF EXISTS stg_finance_ops.campaigns;
-DROP TABLE IF EXISTS stg_finance_ops.donors;
+DROP TABLE IF EXISTS finance_ops.currency_rates;
+DROP TABLE IF EXISTS finance_ops.financial_transactions;
+DROP TABLE IF EXISTS finance_ops.budget_allocations;
+DROP TABLE IF EXISTS finance_ops.payments;
+DROP TABLE IF EXISTS finance_ops.expenses;
+DROP TABLE IF EXISTS finance_ops.expense_categories;
+DROP TABLE IF EXISTS finance_ops.donations;
+DROP TABLE IF EXISTS finance_ops.campaigns;
+DROP TABLE IF EXISTS finance_ops.donors;
 GO
 
 /*=============================================================================
-  3. Donors
+  4. Donor and Campaign Master Tables
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.donors (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    full_name           NVARCHAR(200) NULL,
-    national_id         NVARCHAR(50) NULL,
-    phone               NVARCHAR(30) NULL,
-    email               NVARCHAR(255) NULL,
-    donor_type          NVARCHAR(50) NULL,
-    is_active           BIT NULL,
-    created_at          DATETIME2(0) NULL,
-    updated_at          DATETIME2(0) NULL,
+CREATE TABLE finance_ops.donors (
+    id              INT IDENTITY(1,1) NOT NULL,
+    full_name       NVARCHAR(200) NOT NULL,
+    national_id     NVARCHAR(50) NULL,
+    phone           NVARCHAR(30) NULL,
+    email           NVARCHAR(255) NULL,
+    donor_type      NVARCHAR(50) NOT NULL,
+    is_active       BIT NOT NULL CONSTRAINT DF_finance_donors_is_active DEFAULT (1),
+    created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_donors_created_at DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0) NULL,
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_donors_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donors_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donors_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donors_source_table DEFAULT (N'donors'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_donors_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_donors_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_finance_donors PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT UQ_finance_donors_national_id UNIQUE (national_id),
+    CONSTRAINT CK_finance_donors_donor_type
+        CHECK (donor_type IN (N'individual', N'organization'))
+);
+GO
 
-    CONSTRAINT PK_stg_finance_donors PRIMARY KEY CLUSTERED (stg_row_id)
+CREATE TABLE finance_ops.campaigns (
+    id              INT IDENTITY(1,1) NOT NULL,
+    title           NVARCHAR(300) NOT NULL,
+    description     NVARCHAR(2000) NULL,
+    target_amount   DECIMAL(18,2) NULL,
+    start_date      DATE NULL,
+    end_date        DATE NULL,
+    status          NVARCHAR(50) NOT NULL CONSTRAINT DF_finance_campaigns_status DEFAULT (N'planned'),
+    created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_campaigns_created_at DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0) NULL,
+
+    CONSTRAINT PK_finance_campaigns PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT CK_finance_campaigns_target_amount CHECK (target_amount IS NULL OR target_amount >= 0),
+    CONSTRAINT CK_finance_campaigns_date_range CHECK (end_date IS NULL OR start_date IS NULL OR start_date <= end_date)
 );
 GO
 
 /*=============================================================================
-  4. Campaigns
+  5. Donation Transactions
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.campaigns (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    title               NVARCHAR(300) NULL,
-    description         NVARCHAR(2000) NULL,
-    target_amount       DECIMAL(18,2) NULL,
-    start_date          DATE NULL,
-    end_date            DATE NULL,
-    status              NVARCHAR(50) NULL,
-    created_at          DATETIME2(0) NULL,
-    updated_at          DATETIME2(0) NULL,
+CREATE TABLE finance_ops.donations (
+    id              INT IDENTITY(1,1) NOT NULL,
+    donor_id        INT NOT NULL,
+    campaign_id     INT NULL,
+    amount          DECIMAL(18,2) NOT NULL,
+    currency        CHAR(3) NOT NULL CONSTRAINT DF_finance_donations_currency DEFAULT ('IRR'),
+    donation_type   NVARCHAR(50) NOT NULL,
+    donation_date   DATE NOT NULL,
+    status          NVARCHAR(50) NOT NULL CONSTRAINT DF_finance_donations_status DEFAULT (N'pending'),
+    reference_code  NVARCHAR(100) NULL,
+    created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_donations_created_at DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0) NULL,
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_campaigns_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_campaigns_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_campaigns_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_campaigns_source_table DEFAULT (N'campaigns'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_campaigns_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_campaigns_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_finance_donations PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT FK_finance_donations_donors
+        FOREIGN KEY (donor_id) REFERENCES finance_ops.donors(id),
+    CONSTRAINT FK_finance_donations_campaigns
+        FOREIGN KEY (campaign_id) REFERENCES finance_ops.campaigns(id),
+    CONSTRAINT CK_finance_donations_amount CHECK (amount > 0),
+    CONSTRAINT CK_finance_donations_type
+        CHECK (donation_type IN (N'cash', N'bank_transfer', N'online', N'in_kind')),
+    CONSTRAINT CK_finance_donations_status
+        CHECK (status IN (N'pending', N'confirmed', N'rejected', N'refunded')),
+    CONSTRAINT UQ_finance_donations_reference_code UNIQUE (reference_code)
 
-    CONSTRAINT PK_stg_finance_campaigns PRIMARY KEY CLUSTERED (stg_row_id)
 );
 GO
 
 /*=============================================================================
-  5. Donations
+  6. Expense Categories and Expenses
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.donations (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    donor_id            INT NULL,
-    campaign_id         INT NULL,
-    amount              DECIMAL(18,2) NULL,
-    currency            CHAR(3) NULL,
-    donation_type       NVARCHAR(50) NULL,
-    donation_date       DATE NULL,
-    status              NVARCHAR(50) NULL,
-    reference_code      NVARCHAR(100) NULL,
-    created_at          DATETIME2(0) NULL,
-    updated_at          DATETIME2(0) NULL,
+CREATE TABLE finance_ops.expense_categories (
+    id              INT IDENTITY(1,1) NOT NULL,
+    name            NVARCHAR(200) NOT NULL,
+    is_active       BIT NOT NULL CONSTRAINT DF_finance_expense_categories_is_active DEFAULT (1),
+    created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_expense_categories_created_at DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0) NULL,
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_donations_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donations_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donations_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_donations_source_table DEFAULT (N'donations'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_donations_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_donations_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_donations PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_expense_categories PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT UQ_finance_expense_categories_name UNIQUE (name)
 );
 GO
 
-/*=============================================================================
-  6. Expense Categories
-=============================================================================*/
 
-CREATE TABLE stg_finance_ops.expense_categories (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    name                NVARCHAR(200) NULL,
-    parent_id           INT NULL,
-    is_active           BIT NULL,
-    created_at          DATETIME2(0) NULL,
-    updated_at          DATETIME2(0) NULL,
-
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_expense_categories_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expense_categories_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expense_categories_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expense_categories_source_table DEFAULT (N'expense_categories'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_expense_categories_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_expense_categories_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_expense_categories PRIMARY KEY CLUSTERED (stg_row_id)
-);
-GO
-
-/*=============================================================================
-  7. Expenses
-=============================================================================*/
-
-CREATE TABLE stg_finance_ops.expenses (
-    stg_row_id              BIGINT IDENTITY(1,1) NOT NULL,
-    id                      INT NULL,
-    center_id               INT NULL,
+CREATE TABLE finance_ops.expenses (
+    id                      INT IDENTITY(1,1) NOT NULL,
+    center_id               INT NOT NULL,
     child_id                INT NULL,
-    category_id             INT NULL,
-    amount                  DECIMAL(18,2) NULL,
-    currency                CHAR(3) NULL,
-    expense_date            DATE NULL,
+    category_id             INT NOT NULL,
+    amount                  DECIMAL(18,2) NOT NULL,
+    currency                CHAR(3) NOT NULL CONSTRAINT DF_finance_expenses_currency DEFAULT ('IRR'),
+    expense_date            DATE NOT NULL,
     description             NVARCHAR(2000) NULL,
     approved_by_user_id     INT NULL,
-    status                  NVARCHAR(50) NULL,
-    created_at              DATETIME2(0) NULL,
+    status                  NVARCHAR(50) NOT NULL CONSTRAINT DF_finance_expenses_status DEFAULT (N'pending'),
+    created_at              DATETIME2(0) NOT NULL CONSTRAINT DF_finance_expenses_created_at DEFAULT (SYSDATETIME()),
     updated_at              DATETIME2(0) NULL,
 
-    etl_batch_id            INT NULL,
-    source_system           NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_expenses_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database         NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expenses_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema           NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expenses_source_schema DEFAULT (N'finance_ops'),
-    source_table            NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_expenses_source_table DEFAULT (N'expenses'),
-    extracted_at            DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_expenses_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at       DATETIME2(0) NULL,
-    row_hash                VARBINARY(32) NULL,
-    is_valid                BIT NOT NULL CONSTRAINT DF_stg_finance_expenses_is_valid DEFAULT (1),
-    validation_message      NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_expenses PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_expenses PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT FK_finance_expenses_categories
+        FOREIGN KEY (category_id) REFERENCES finance_ops.expense_categories(id),
+    CONSTRAINT CK_finance_expenses_amount CHECK (amount > 0),
+    CONSTRAINT CK_finance_expenses_status
+        CHECK (status IN (N'pending', N'approved', N'rejected'))
 );
 GO
 
 /*=============================================================================
-  8. Payments
+  7. Payments
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.payments (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    payment_type        NVARCHAR(50) NULL,
-    teacher_id          INT NULL,
-    center_id           INT NULL,
-    amount              DECIMAL(18,2) NULL,
-    currency            CHAR(3) NULL,
-    payment_date        DATE NULL,
-    status              NVARCHAR(50) NULL,
-    created_at          DATETIME2(0) NULL,
-    updated_at          DATETIME2(0) NULL,
+CREATE TABLE finance_ops.payments (
+    id              INT IDENTITY(1,1) NOT NULL,
+    payment_type    NVARCHAR(50) NOT NULL,
+    teacher_id      INT NULL,
+    center_id       INT NOT NULL,
+    amount          DECIMAL(18,2) NOT NULL,
+    currency        CHAR(3) NOT NULL CONSTRAINT DF_finance_payments_currency DEFAULT ('IRR'),
+    payment_date    DATE NOT NULL,
+    status          NVARCHAR(50) NOT NULL CONSTRAINT DF_finance_payments_status DEFAULT (N'pending'),
+    created_at      DATETIME2(0) NOT NULL CONSTRAINT DF_finance_payments_created_at DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0) NULL,
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_payments_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_payments_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_payments_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_payments_source_table DEFAULT (N'payments'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_payments_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_payments_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_payments PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_payments PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT CK_finance_payments_amount CHECK (amount > 0),
+    CONSTRAINT CK_finance_payments_type
+        CHECK (payment_type IN (N'salary', N'bonus', N'vendor', N'refund')),
+    CONSTRAINT CK_finance_payments_status
+        CHECK (status IN (N'pending', N'approved', N'paid', N'cancelled', N'rejected'))
 );
 GO
 
 /*=============================================================================
-  9. Budget Allocations
+  8. Budget Allocation Events
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.budget_allocations (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    source_type         NVARCHAR(50) NULL,
+CREATE TABLE finance_ops.budget_allocations (
+    id                  INT IDENTITY(1,1) NOT NULL,
+    source_type         NVARCHAR(50) NOT NULL,
     source_id           INT NULL,
-    center_id           INT NULL,
+    center_id           INT NOT NULL,
     child_id            INT NULL,
     category_id         INT NULL,
-    allocated_amount    DECIMAL(18,2) NULL,
-    allocation_date     DATE NULL,
+    allocated_amount    DECIMAL(18,2) NOT NULL,
+    allocation_date     DATE NOT NULL,
     reason              NVARCHAR(2000) NULL,
-    created_at          DATETIME2(0) NULL,
+    created_at          DATETIME2(0) NOT NULL CONSTRAINT DF_finance_budget_allocations_created_at DEFAULT (SYSDATETIME()),
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_source_table DEFAULT (N'budget_allocations'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_budget_allocations_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_budget_allocations PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_budget_allocations PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT FK_finance_budget_allocations_categories
+        FOREIGN KEY (category_id) REFERENCES finance_ops.expense_categories(id),
+    CONSTRAINT CK_finance_budget_allocations_amount CHECK (allocated_amount > 0),
+    CONSTRAINT CK_finance_budget_allocations_source_type
+        CHECK (source_type IN (N'donation', N'internal_budget'))
 );
 GO
 
 /*=============================================================================
-  10. Financial Transactions
+  9. Optional Financial Audit / Transaction Layer
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.financial_transactions (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  BIGINT NULL,
-    entity_type         NVARCHAR(50) NULL,
-    entity_id           INT NULL,
-    transaction_type    NVARCHAR(50) NULL,
-    amount              DECIMAL(18,2) NULL,
-    transaction_date    DATE NULL,
-    created_at          DATETIME2(0) NULL,
+CREATE TABLE finance_ops.financial_transactions (
+    id                  BIGINT IDENTITY(1,1) NOT NULL,
+    entity_type         NVARCHAR(50) NOT NULL,
+    entity_id           INT NOT NULL,
+    transaction_type    NVARCHAR(50) NOT NULL,
+    amount              DECIMAL(18,2) NOT NULL,
+    transaction_date    DATE NOT NULL,
+    created_at          DATETIME2(0) NOT NULL CONSTRAINT DF_finance_financial_transactions_created_at DEFAULT (SYSDATETIME()),
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_source_table DEFAULT (N'financial_transactions'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_financial_transactions_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_financial_transactions PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_financial_transactions PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT CK_finance_financial_transactions_entity_type
+        CHECK (entity_type IN (N'donation', N'expense', N'payment')),
+    CONSTRAINT CK_finance_financial_transactions_transaction_type
+        CHECK (transaction_type IN (N'credit', N'debit')),
+    CONSTRAINT CK_finance_financial_transactions_amount CHECK (amount > 0)
 );
 GO
 
 /*=============================================================================
-  11. Currency Rates
+  10. Optional Currency Rates
 =============================================================================*/
 
-CREATE TABLE stg_finance_ops.currency_rates (
-    stg_row_id          BIGINT IDENTITY(1,1) NOT NULL,
-    id                  INT NULL,
-    from_currency       CHAR(3) NULL,
-    to_currency         CHAR(3) NULL,
-    rate                DECIMAL(18,8) NULL,
-    rate_date           DATE NULL,
+CREATE TABLE finance_ops.currency_rates (
+    id              INT IDENTITY(1,1) NOT NULL,
+    from_currency   CHAR(3) NOT NULL,
+    to_currency     CHAR(3) NOT NULL,
+    rate            DECIMAL(18,8) NOT NULL,
+    rate_date       DATE NOT NULL,
 
-    etl_batch_id        INT NULL,
-    source_system       NVARCHAR(100) NOT NULL CONSTRAINT DF_stg_finance_currency_rates_source_system DEFAULT (N'FINANCE_OPS'),
-    source_database     NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_currency_rates_source_database DEFAULT (N'Source_FinanceOps_DB'),
-    source_schema       NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_currency_rates_source_schema DEFAULT (N'finance_ops'),
-    source_table        NVARCHAR(128) NOT NULL CONSTRAINT DF_stg_finance_currency_rates_source_table DEFAULT (N'currency_rates'),
-    extracted_at        DATETIME2(0) NOT NULL CONSTRAINT DF_stg_finance_currency_rates_extracted_at DEFAULT (SYSDATETIME()),
-    source_updated_at   DATETIME2(0) NULL,
-    row_hash            VARBINARY(32) NULL,
-    is_valid            BIT NOT NULL CONSTRAINT DF_stg_finance_currency_rates_is_valid DEFAULT (1),
-    validation_message  NVARCHAR(MAX) NULL,
-
-    CONSTRAINT PK_stg_finance_currency_rates PRIMARY KEY CLUSTERED (stg_row_id)
+    CONSTRAINT PK_finance_currency_rates PRIMARY KEY CLUSTERED (id),
+    CONSTRAINT CK_finance_currency_rates_rate CHECK (rate > 0),
+    CONSTRAINT UQ_finance_currency_rates_pair_date
+        UNIQUE (from_currency, to_currency, rate_date)
 );
 GO
 
 /*=============================================================================
-  12. Helpful Staging Indexes
+  11. Helpful Indexes for ETL Extraction
 =============================================================================*/
 
-CREATE INDEX IX_stg_finance_donors_source_id
-    ON stg_finance_ops.donors(id);
+CREATE INDEX IX_finance_donors_updated_at
+    ON finance_ops.donors(updated_at);
 GO
 
-CREATE INDEX IX_stg_finance_donors_national_id
-    ON stg_finance_ops.donors(national_id);
+CREATE INDEX IX_finance_campaigns_updated_at
+    ON finance_ops.campaigns(updated_at);
 GO
 
-CREATE INDEX IX_stg_finance_campaigns_source_id
-    ON stg_finance_ops.campaigns(id);
+CREATE INDEX IX_finance_donations_date
+    ON finance_ops.donations(donation_date, donor_id, campaign_id);
 GO
 
-CREATE INDEX IX_stg_finance_donations_source_id
-    ON stg_finance_ops.donations(id);
+CREATE INDEX IX_finance_donations_status
+    ON finance_ops.donations(status);
 GO
 
-CREATE INDEX IX_stg_finance_donations_date
-    ON stg_finance_ops.donations(donation_date, donor_id, campaign_id);
+CREATE INDEX IX_finance_donations_updated_at
+    ON finance_ops.donations(updated_at);
 GO
 
-CREATE INDEX IX_stg_finance_donations_reference
-    ON stg_finance_ops.donations(reference_code);
+CREATE INDEX IX_finance_expenses_date
+    ON finance_ops.expenses(expense_date, center_id, child_id, category_id);
 GO
 
-CREATE INDEX IX_stg_finance_expense_categories_source_id
-    ON stg_finance_ops.expense_categories(id);
+CREATE INDEX IX_finance_expenses_status
+    ON finance_ops.expenses(status);
 GO
 
-CREATE INDEX IX_stg_finance_expenses_source_id
-    ON stg_finance_ops.expenses(id);
+CREATE INDEX IX_finance_expenses_updated_at
+    ON finance_ops.expenses(updated_at);
 GO
 
-CREATE INDEX IX_stg_finance_expenses_date
-    ON stg_finance_ops.expenses(expense_date, center_id, child_id, category_id);
+CREATE INDEX IX_finance_payments_date
+    ON finance_ops.payments(payment_date, center_id, teacher_id);
 GO
 
-CREATE INDEX IX_stg_finance_payments_source_id
-    ON stg_finance_ops.payments(id);
+CREATE INDEX IX_finance_payments_status
+    ON finance_ops.payments(status);
 GO
 
-CREATE INDEX IX_stg_finance_payments_date
-    ON stg_finance_ops.payments(payment_date, center_id, teacher_id);
+CREATE INDEX IX_finance_payments_updated_at
+    ON finance_ops.payments(updated_at);
 GO
 
-CREATE INDEX IX_stg_finance_budget_allocations_source_id
-    ON stg_finance_ops.budget_allocations(id);
+CREATE INDEX IX_finance_budget_allocations_date
+    ON finance_ops.budget_allocations(allocation_date, center_id, child_id, category_id);
 GO
 
-CREATE INDEX IX_stg_finance_budget_allocations_date
-    ON stg_finance_ops.budget_allocations(allocation_date, center_id, child_id, category_id);
+CREATE INDEX IX_finance_financial_transactions_entity
+    ON finance_ops.financial_transactions(entity_type, entity_id);
 GO
 
-CREATE INDEX IX_stg_finance_financial_transactions_entity
-    ON stg_finance_ops.financial_transactions(entity_type, entity_id);
+CREATE INDEX IX_finance_financial_transactions_date
+    ON finance_ops.financial_transactions(transaction_date);
 GO
 
-CREATE INDEX IX_stg_finance_currency_rates_date
-    ON stg_finance_ops.currency_rates(rate_date, from_currency, to_currency);
-GO
-
-/* ETL metadata indexes */
-
-CREATE INDEX IX_stg_finance_donors_etl_batch
-    ON stg_finance_ops.donors(etl_batch_id, extracted_at);
-GO
-
-CREATE INDEX IX_stg_finance_donations_etl_batch
-    ON stg_finance_ops.donations(etl_batch_id, extracted_at);
-GO
-
-CREATE INDEX IX_stg_finance_expenses_etl_batch
-    ON stg_finance_ops.expenses(etl_batch_id, extracted_at);
-GO
-
-CREATE INDEX IX_stg_finance_payments_etl_batch
-    ON stg_finance_ops.payments(etl_batch_id, extracted_at);
-GO
-
-CREATE INDEX IX_stg_finance_budget_allocations_etl_batch
-    ON stg_finance_ops.budget_allocations(etl_batch_id, extracted_at);
+CREATE INDEX IX_finance_currency_rates_date
+    ON finance_ops.currency_rates(rate_date, from_currency, to_currency);
 GO
 
 /*=============================================================================
-  13. Completion and Verification
+  12. Completion Message
 =============================================================================*/
 
-PRINT 'Finance Operations staging tables created successfully.';
-
-SELECT
-    s.name AS schema_name,
-    t.name AS table_name
-FROM sys.tables t
-JOIN sys.schemas s
-    ON s.schema_id = t.schema_id
-WHERE s.name = N'stg_finance_ops'
-ORDER BY t.name;
+PRINT 'Source_FinanceOps_DB created successfully.';
+PRINT 'Schema created: finance_ops';
+PRINT 'Phase 1 script completed: Finance Operations operational source database.';
 GO

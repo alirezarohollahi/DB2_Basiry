@@ -433,6 +433,7 @@ BEGIN
         DBCC CHECKIDENT ('dw.dim_child', RESEED, 0) WITH NO_INFOMSGS;
 
         SET IDENTITY_INSERT dw.dim_child ON;
+
         INSERT INTO dw.dim_child
             (child_key, child_id, first_name, last_name, full_name, birth_date,
              gender, center_id, status, enrollment_date, source_system, row_hash,
@@ -452,6 +453,7 @@ BEGIN
         FROM etl_work.w_dim_child
         WHERE child_key IS NOT NULL;
         SET IDENTITY_INSERT dw.dim_child OFF;
+
 
         INSERT INTO dw.dim_child
             (child_id, first_name, last_name, full_name, birth_date,
@@ -580,8 +582,11 @@ BEGIN
         LEFT JOIN dw.dim_domain old ON old.domain_id=s.id AND old.domain_key<>-1;
 
         SELECT @rows_read=COUNT(*) FROM etl_work.w_dim_domain;
+
         TRUNCATE TABLE dw.dim_domain;
+        
         DBCC CHECKIDENT ('dw.dim_domain', RESEED, 0) WITH NO_INFOMSGS;
+    
         SET IDENTITY_INSERT dw.dim_domain ON;
         INSERT INTO dw.dim_domain (domain_key, domain_id, domain_name, domain_description, domain_status, source_system, row_hash, created_at, updated_at)
         VALUES (-1,-1,N'Unknown',N'Unknown',N'unknown',N'SYSTEM',NULL,SYSDATETIME(),SYSDATETIME());
